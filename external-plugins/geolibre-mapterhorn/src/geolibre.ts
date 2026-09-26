@@ -1,0 +1,110 @@
+import type { GeoLibreAppAPI, GeoLibrePlugin } from "./lib/geolibre/host-api";
+import { MapterhornControl } from "./lib/mapterhorn/control";
+import { MapterhornLayerManager } from "./lib/mapterhorn/layer-manager";
+import { DEFAULT_SETTINGS, normalizeSettings, type MapterhornSettings } from "./lib/mapterhorn/settings";
+import { renderMapterhornPanel, type MapterhornPanelHandle } from "./lib/panel/panel";
+import {
+  MAPTERHORN_URL_PARAMETER_NAMES,
+  decodeSettingsFromUrlParams,
+  encodeSettingsToUrlParams,
+} from "./lib/utils/deep-link";
+
+const PLUGIN_ID = "geolibre-mapterhorn";
+const RIGHT_PANEL_ID = "geolibre-mapterhorn-panel";
+
+let settings: MapterhornSettings = { ...DEFAULT_SETTINGS };
+let control: MapterhornControl | null = null;
+let layerManager: MapterhornLayerManager | null = null;
+let panelHandle: MapterhornPanelHandle | null = null;
+let unregisterRightPanel: (() => void) | null = null;
+
+function applySettings(app: GeoLibreAppAPI, patch: Partial<MapterhornSettings>): void {
+  settings = normalizeSettings(patch, settings);
+  layerManager?.update(settings);
+}
+
+const plugin: GeoLibrePlugin = {
+  id: PLUGIN_ID,
+  name: "Mapterhorn Terrain",
+  version: "0.1.0",
+  urlParameterNames: MAPTERHORN_URL_PARAMETER_NAMES,
+
+  activate(app: GeoLibreAppAPI): boolean | void {
+    const map = app.getMap?.();
+    if (!map) {
+      // Suspended engines (Cesium/Mapbox/ArcGIS) never call activate() thanks
+      // to `engines: ["maplibre"]`, but guard anyway in case a host build
+      // routes activation before the map is ready.
+      return false;
+    }
+
+    layerManager = new MapterhornLayerManager(map, settings, (stats) => panelHandle?.setStats(stats));
+    layerManager.mount();
+
+    control = new MapterhornControl(() => {
+      const active = app.getActiveRightPanel?.() === RIGHT_PANEL_ID;
+      if (active) app.closeRightPanel?.(RIGHT_PANEL_ID);
+      else app.openRightPanel?.(RIGHT_PANEL_ID);
+    });
+    const added = app.addMapControl(control, "top-right");
+    if (!added) {
+      layerManager.unmount();
+      layerManager = null;
+      control = null;
+      return false;
+    }
+
+    unregisterRightPanel =
+      app.registerRightPanel?.({
+        id: RIGHT_PANEL_ID,
+        title: "Mapterhorn Terrain",
+        defaultWidth: 300,
+        render: (container) => {
+          panelHandle = renderMapterhornPanel(container, settings, (patch) => applySettings(app, patch));
+          return () => {
+            panelHandle?.destroy();
+            panelHandle = null;
+          };
+        },
+      }) ?? null;
+  },
+
+  deactivate(app: GeoLibreAppAPI): void {
+    unregisterRightPanel?.();
+    unregisterRightPanel = null;
+    panelHandle = null;
+
+    if (control) {
+      app.removeMapControl(control);
+      control = null;
+    }
+
+    layerManager?.unmount();
+    layerManager = null;
+  },
+
+  handleUrlParameters(app: GeoLibreAppAPI, params: URLSearchParams): void {
+    settings = decodeSettingsFromUrlParams(params, settings);
+    layerManager?.update(settings);
+    app.openRightPanel?.(RIGHT_PANEL_ID);
+  },
+
+  getProjectState(): unknown {
+    return settings;
+  },
+
+  applyProjectState(app: GeoLibreAppAPI, state: unknown): boolean | void {
+    if (!state || typeof state !== "object") return false;
+    settings = normalizeSettings(state as Partial<MapterhornSettings>, DEFAULT_SETTINGS);
+    layerManager?.update(settings);
+    return true;
+  },
+};
+
+// Exposed for a plugin's own toolbar/share-link affordances, if ever added;
+// unused internally beyond deep-link round-tripping tested in
+// tests/deep-link.test.ts.
+export { encodeSettingsToUrlParams };
+
+export default plugin;
+export { plugin };
