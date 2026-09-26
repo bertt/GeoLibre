@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { lngLatToTile, tileToLngLat } from "../src/lib/mapterhorn/color-overlay";
+import { lngLatToTile, tileToLngLat } from "../src/lib/mapterhorn/tile-math";
 
 describe("lngLatToTile / tileToLngLat", () => {
   it("maps the origin (0, 0) to the four center tiles at zoom 1", () => {

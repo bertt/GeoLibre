@@ -1,4 +1,3 @@
-import { VECTOR_COLOR_RAMPS } from "../mapterhorn/color-ramp";
 import { SETTINGS_LIMITS, type MapterhornSettings } from "../mapterhorn/settings";
 import type { OutlierTrimResult } from "../mapterhorn/outlier-stats";
 
@@ -61,18 +60,6 @@ export function renderMapterhornPanel(
   );
   appendToggle(form, "3D terrain", settings.terrain3d, (value) => emit({ terrain3d: value }));
 
-  appendSection(form, "Color");
-  appendSelect(
-    form,
-    "Color ramp",
-    VECTOR_COLOR_RAMPS.map((ramp) => ({ value: ramp.value, label: ramp.label })),
-    settings.colorRamp,
-    (value) => emit({ colorRamp: value }),
-  );
-  appendSlider(form, "Color opacity", settings.colorOpacity, SETTINGS_LIMITS.colorOpacity, (value) =>
-    emit({ colorOpacity: value }),
-  );
-
   appendSection(form, "Contours");
   appendToggle(form, "Show contours", settings.contours, (value) => emit({ contours: value }));
   appendSlider(
@@ -114,7 +101,7 @@ export function renderMapterhornPanel(
       const format = (value: number) => `${Math.round(value)} m`;
       statsEl.textContent =
         `Observed: ${format(stats.observedMin)} \u2013 ${format(stats.observedMax)} ` +
-        `\u2022 Color scale: ${format(stats.min)} \u2013 ${format(stats.max)} ` +
+        `\u2022 Trimmed: ${format(stats.min)} \u2013 ${format(stats.max)} ` +
         `\u2022 Samples: ${stats.sampleCount.toLocaleString()}`;
     },
     destroy(): void {

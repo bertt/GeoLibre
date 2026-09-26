@@ -13,8 +13,6 @@ const PARAM_KEYS: Record<string, keyof MapterhornSettings> = {
   mtHillshade: "hillshadeStrength",
   mtDirection: "hillshadeDirection",
   mtTerrain3d: "terrain3d",
-  mtRamp: "colorRamp",
-  mtOpacity: "colorOpacity",
   mtContours: "contours",
   mtContourInterval: "contourInterval",
   mtContourSmoothing: "contourSmoothing",

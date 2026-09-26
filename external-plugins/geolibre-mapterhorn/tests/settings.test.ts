@@ -25,7 +25,7 @@ describe("normalizeSettings", () => {
   });
 
   it("leaves values already within range untouched", () => {
-    const result = normalizeSettings({ colorOpacity: 0.42 });
-    expect(result.colorOpacity).toBe(0.42);
+    const result = normalizeSettings({ outlierPercentile: 4.2 });
+    expect(result.outlierPercentile).toBe(4.2);
   });
 });

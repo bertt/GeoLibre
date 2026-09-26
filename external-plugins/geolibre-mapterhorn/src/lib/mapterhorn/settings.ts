@@ -12,10 +12,6 @@ export type MapterhornSettings = {
   hillshadeDirection: number;
   /** Pitched 3D terrain mode (`map.setTerrain(...)`) vs. flat 2D shading. */
   terrain3d: boolean;
-  /** Hypsometric color ramp name, from `./color-ramp`'s `VECTOR_COLOR_RAMPS`. */
-  colorRamp: string;
-  /** Opacity (0-1) of the hypsometric color-tint layer over the hillshade. */
-  colorOpacity: number;
   /** Contour line overlay toggle (default off). */
   contours: boolean;
   /** Contour interval in meters. */
@@ -33,8 +29,6 @@ export const DEFAULT_SETTINGS: MapterhornSettings = {
   hillshadeStrength: 0.5,
   hillshadeDirection: 315,
   terrain3d: true,
-  colorRamp: "terrain",
-  colorOpacity: 0.6,
   contours: false,
   contourInterval: 100,
   contourSmoothing: "gentle",
@@ -46,7 +40,6 @@ export const SETTINGS_LIMITS = {
   exaggeration: { min: 0, max: 5, step: 0.1 },
   hillshadeStrength: { min: 0, max: 1, step: 0.05 },
   hillshadeDirection: { min: 0, max: 360, step: 1 },
-  colorOpacity: { min: 0, max: 1, step: 0.05 },
   contourInterval: { min: 5, max: 1000, step: 5 },
   outlierPercentile: { min: 0, max: 25, step: 0.5 },
 } as const;
@@ -73,7 +66,6 @@ export function normalizeSettings(
     hillshadeDirection: Number.isFinite(merged.hillshadeDirection)
       ? ((merged.hillshadeDirection % 360) + 360) % 360
       : DEFAULT_SETTINGS.hillshadeDirection,
-    colorOpacity: clamp(merged.colorOpacity, SETTINGS_LIMITS.colorOpacity.min, SETTINGS_LIMITS.colorOpacity.max),
     contourInterval: clamp(
       merged.contourInterval,
       SETTINGS_LIMITS.contourInterval.min,

@@ -1,21 +1,19 @@
 import type { Map as MapLibreMap } from "maplibre-gl";
-import { getVectorColorRamp, interpolateColors, parseHexColor } from "./color-ramp";
 import { extractContours, smoothGrid, type ContourSmoothing } from "./contours";
 import { computeOutlierTrim, ElevationHistogramAccumulator, type OutlierTrimResult } from "./outlier-stats";
 import { decodeTerrariumImage, mapterhornTileUrl, MAPTERHORN_MAX_ZOOM, MAPTERHORN_TILE_SIZE } from "./terrarium";
+import { lngLatToTile, tileToLngLat } from "./tile-math";
 
-const RAMP_SAMPLES = 256;
 /** Above this many tiles in view, skip drawing rather than fetch a huge grid (e.g. a very low zoom or a degenerate bounds read). */
 const MAX_TILES_PER_REDRAW = 512;
 const WEB_MERCATOR_MAX_LATITUDE = 85.05112878;
 
-export type MapterhornColorOverlayOptions = {
-  getColorRamp: () => string;
-  getTrimOutliers: () => boolean;
-  getOutlierPercentile: () => number;
-  getContours: () => boolean;
+export type MapterhornContourOverlayOptions = {
   getContourInterval: () => number;
   getContourSmoothing: () => ContourSmoothing;
+  /** Outlier-trim controls only feed the stats readout here (there is no color scale to clip). */
+  getTrimOutliers: () => boolean;
+  getOutlierPercentile: () => number;
   /** Called after each tile decodes, so the stats panel can refresh. */
   onStatsUpdated?: (stats: OutlierTrimResult) => void;
 };
@@ -27,10 +25,13 @@ type CachedTile = {
 };
 
 /**
- * Renders outlier-trimmed hypsometric tint + contour lines for the
- * currently visible Mapterhorn tiles as a plain 2D `<canvas>` overlay
- * positioned over the map and redrawn via `map.project()` on every
- * pan/zoom/resize.
+ * Renders contour lines for the currently visible Mapterhorn tiles as a
+ * plain 2D `<canvas>` overlay positioned over the map and redrawn via
+ * `map.project()` on every pan/zoom/resize. Also feeds the outlier-trim
+ * statistics readout in the right panel (elevation histogram, min/max),
+ * since decoding a tile's elevation grid here is the natural place to sample
+ * it — this overlay does not otherwise use outlier-trim to affect its own
+ * rendering.
  *
  * Why not a MapLibre *source*: MapLibre GL JS has no `type: "custom"`
  * **source** (that is Mapbox GL JS's `CustomSourceInterface` — MapLibre only
@@ -51,13 +52,17 @@ type CachedTile = {
  * whenever 3D terrain is enabled, so pitching the camera never shows a
  * floating flat sheet over the pitched relief — 3D mode falls back to
  * hillshade + terrain only (the native `raster-dem`/`hillshade`/
- * `setTerrain` pipeline, unaffected by any of this).
+ * `setTerrain` pipeline, unaffected by any of this). Rendering true contour
+ * lines that drape over 3D terrain/globe would require a native MapLibre
+ * vector layer instead of this canvas; left as a known limitation (contours
+ * are a flat, 2D-only feature by design, matching the plugin's other 2D-only
+ * overlay behavior).
  */
-export class MapterhornColorOverlay {
+export class MapterhornContourOverlay {
   private readonly map: MapLibreMap;
   private readonly canvas: HTMLCanvasElement;
   private readonly ctx: CanvasRenderingContext2D;
-  private options: MapterhornColorOverlayOptions;
+  private options: MapterhornContourOverlayOptions;
   private readonly tiles = new Map<string, CachedTile>();
   private readonly pending = new Set<string>();
   private readonly histogram = new ElevationHistogramAccumulator();
@@ -72,7 +77,7 @@ export class MapterhornColorOverlay {
     this.scheduleRedraw();
   };
 
-  constructor(map: MapLibreMap, options: MapterhornColorOverlayOptions) {
+  constructor(map: MapLibreMap, options: MapterhornContourOverlayOptions) {
     this.map = map;
     this.options = options;
     this.canvas = document.createElement("canvas");
@@ -116,12 +121,8 @@ export class MapterhornColorOverlay {
     if (visible) this.scheduleRedraw();
   }
 
-  setOpacity(opacity: number): void {
-    this.canvas.style.opacity = String(opacity);
-  }
-
-  /** Drops cached tiles and re-renders — call after a color/contour/outlier setting changes. */
-  invalidate(options: MapterhornColorOverlayOptions): void {
+  /** Drops cached tiles and re-renders — call after a contour/outlier setting changes. */
+  invalidate(options: MapterhornContourOverlayOptions): void {
     this.options = options;
     for (const tile of this.tiles.values()) tile.bitmap.close();
     this.tiles.clear();
@@ -227,14 +228,7 @@ export class MapterhornColorOverlay {
 
   private settingsFingerprint(): string {
     const o = this.options;
-    return [
-      o.getColorRamp(),
-      o.getTrimOutliers(),
-      o.getOutlierPercentile(),
-      o.getContours(),
-      o.getContourInterval(),
-      o.getContourSmoothing(),
-    ].join("|");
+    return [o.getContourInterval(), o.getContourSmoothing()].join("|");
   }
 
   private async loadAndProcessTile(x: number, y: number, z: number): Promise<ImageBitmap> {
@@ -260,47 +254,12 @@ export class MapterhornColorOverlay {
     );
     this.options.onStatsUpdated?.(trim);
 
-    const ramp = getVectorColorRamp(this.options.getColorRamp());
-    const palette = interpolateColors(ramp.colors, RAMP_SAMPLES);
-    const rgbPalette = palette.map((hex) => parseHexColor(hex));
-
     const output = ctx.createImageData(size, size);
-    const span = Math.max(1e-6, trim.max - trim.min);
-    for (let i = 0; i < elevations.length; i += 1) {
-      const t = Math.min(1, Math.max(0, (elevations[i] - trim.min) / span));
-      const paletteIndex = Math.min(RAMP_SAMPLES - 1, Math.round(t * (RAMP_SAMPLES - 1)));
-      const color = rgbPalette[paletteIndex];
-      const offset = i * 4;
-      output.data[offset] = color.r;
-      output.data[offset + 1] = color.g;
-      output.data[offset + 2] = color.b;
-      output.data[offset + 3] = 255;
-    }
-
-    if (this.options.getContours()) {
-      drawContours(output, elevations, size, size, this.options.getContourInterval(), this.options.getContourSmoothing());
-    }
+    drawContours(output, elevations, size, size, this.options.getContourInterval(), this.options.getContourSmoothing());
 
     ctx.putImageData(output, 0, 0);
     return createImageBitmap(canvas);
   }
-}
-
-/** Standard slippy-map tile math: lng/lat (deg) to the containing tile index at zoom `z`. */
-export function lngLatToTile(lng: number, lat: number, z: number): { x: number; y: number } {
-  const n = 2 ** z;
-  const x = Math.floor(((lng + 180) / 360) * n);
-  const latRad = (lat * Math.PI) / 180;
-  const y = Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n);
-  return { x, y };
-}
-
-/** Inverse of {@link lngLatToTile}: the lng/lat (deg) of tile `(x, y)`'s NW corner at zoom `z`. */
-export function tileToLngLat(x: number, y: number, z: number): { lng: number; lat: number } {
-  const n = 2 ** z;
-  const lng = (x / n) * 360 - 180;
-  const latRad = Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / n)));
-  return { lng, lat: (latRad * 180) / Math.PI };
 }
 
 function drawContours(

@@ -1,7 +1,7 @@
 {
   "name": "geolibre-mapterhorn",
   "version": "0.1.0",
-  "description": "GeoLibre plugin: live hillshade, vertical exaggeration, 3D terrain, contours, and outlier-trimmed hypsometric tinting from Mapterhorn global terrain tiles.",
+  "description": "GeoLibre plugin: live hillshade, vertical exaggeration, 3D terrain, and contours from Mapterhorn global terrain tiles, with an outlier-trimmed elevation statistics readout.",
   "type": "module",
   "private": true,
   "scripts": {

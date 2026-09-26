@@ -1,5 +1,5 @@
 import type { Map as MapLibreMap } from "maplibre-gl";
-import { MapterhornColorOverlay } from "./color-overlay";
+import { MapterhornContourOverlay } from "./contour-overlay";
 import type { OutlierTrimResult } from "./outlier-stats";
 import type { MapterhornSettings } from "./settings";
 import {
@@ -20,17 +20,18 @@ export const MAPTERHORN_HILLSHADE_LAYER_ID = "mapterhorn-hillshade-layer";
  * - `raster-dem` (native, `encoding: "terrarium"`) feeds MapLibre's built-in
  *   `hillshade` layer and `map.setTerrain(...)` for 3D — no custom code
  *   needed for either.
- * - A `map.project()`-synced 2D canvas overlay (`MapterhornColorOverlay`)
- *   decodes the same tiles a second time to render outlier-trimmed
- *   hypsometric color tinting and contour lines, which MapLibre has no
- *   native support for (see that class's docstring for why this is a DOM
- *   overlay rather than a MapLibre source/layer). Because it is a flat 2D
- *   overlay, it is hidden whenever 3D terrain is enabled, **and whenever the
- *   map is in globe projection** (a flat rectangle can't be wrapped onto a
- *   sphere; without this it renders as a flat plane floating in front of/
- *   behind the globe). Visibility is re-checked on MapLibre's
- *   `projectiontransition` event, which fires whenever the user toggles
- *   GeoLibre's globe control.
+ * - A `map.project()`-synced 2D canvas overlay (`MapterhornContourOverlay`)
+ *   decodes the same tiles a second time to render contour lines, which
+ *   MapLibre has no native support for (see that class's docstring for why
+ *   this is a DOM overlay rather than a MapLibre source/layer). It also
+ *   feeds the outlier-trim elevation statistics readout in the panel. Because
+ *   it is a flat 2D overlay, it is hidden whenever 3D terrain is enabled,
+ *   **and whenever the map is in globe projection** (a flat rectangle can't
+ *   be wrapped onto a sphere; without this it renders as a flat plane
+ *   floating in front of/behind the globe), **and whenever contours are
+ *   toggled off** (its sole remaining purpose). Visibility is re-checked on
+ *   MapLibre's `projectiontransition` event, which fires whenever the user
+ *   toggles GeoLibre's globe control.
  *
  * Enabling 3D terrain also tilts the camera (`map.easeTo({ pitch: 60 })`) if
  * it is currently close to top-down: elevation displacement on a globe/map
@@ -43,7 +44,7 @@ export const MAPTERHORN_HILLSHADE_LAYER_ID = "mapterhorn-hillshade-layer";
 export class MapterhornLayerManager {
   private readonly map: MapLibreMap;
   private settings: MapterhornSettings;
-  private readonly colorOverlay: MapterhornColorOverlay;
+  private readonly contourOverlay: MapterhornContourOverlay;
   private added = false;
   /** Tracks whether `applyTerrain()` tilted the camera, so disabling 3D terrain only restores the pitch this plugin itself introduced (never fights a pitch the user set by hand). */
   private pitchedByPlugin = false;
@@ -53,11 +54,9 @@ export class MapterhornLayerManager {
   constructor(map: MapLibreMap, settings: MapterhornSettings, onStatsUpdated: (stats: OutlierTrimResult) => void) {
     this.map = map;
     this.settings = settings;
-    this.colorOverlay = new MapterhornColorOverlay(map, {
-      getColorRamp: () => this.settings.colorRamp,
+    this.contourOverlay = new MapterhornContourOverlay(map, {
       getTrimOutliers: () => this.settings.trimOutliers,
       getOutlierPercentile: () => this.settings.outlierPercentile,
-      getContours: () => this.settings.contours,
       getContourInterval: () => this.settings.contourInterval,
       getContourSmoothing: () => this.settings.contourSmoothing,
       onStatsUpdated,
@@ -89,8 +88,7 @@ export class MapterhornLayerManager {
       layout: { visibility: this.settings.enabled ? "visible" : "none" },
     });
 
-    this.colorOverlay.mount();
-    this.colorOverlay.setOpacity(this.settings.colorOpacity);
+    this.contourOverlay.mount();
 
     this.added = true;
     this.syncOverlayVisibility();
@@ -105,7 +103,7 @@ export class MapterhornLayerManager {
     const { map } = this;
     map.off("projectiontransition", this.onProjectionTransition);
     if (map.getTerrain()?.source === MAPTERHORN_DEM_SOURCE_ID) map.setTerrain(null);
-    this.colorOverlay.unmount();
+    this.contourOverlay.unmount();
     if (map.getLayer(MAPTERHORN_HILLSHADE_LAYER_ID)) map.removeLayer(MAPTERHORN_HILLSHADE_LAYER_ID);
     if (map.getSource(MAPTERHORN_DEM_SOURCE_ID)) map.removeSource(MAPTERHORN_DEM_SOURCE_ID);
     this.added = false;
@@ -113,10 +111,10 @@ export class MapterhornLayerManager {
 
   /**
    * Applies a settings patch. Live-updatable paint properties (hillshade
-   * strength/direction, exaggeration, opacity, visibility) apply instantly;
-   * changes that affect tile pixel content (color ramp, outlier trim,
-   * contours) require re-rendering already-decoded tiles, done by
-   * invalidating the color overlay's tile cache.
+   * strength/direction, exaggeration, visibility) apply instantly; changes
+   * that affect tile pixel content (contour interval/smoothing, outlier
+   * trim) require re-rendering already-decoded tiles, done by invalidating
+   * the contour overlay's tile cache.
    */
   update(next: MapterhornSettings): void {
     const previous = this.settings;
@@ -129,10 +127,9 @@ export class MapterhornLayerManager {
     map.setPaintProperty(MAPTERHORN_HILLSHADE_LAYER_ID, "hillshade-exaggeration", next.hillshadeStrength);
     map.setPaintProperty(MAPTERHORN_HILLSHADE_LAYER_ID, "hillshade-illumination-direction", next.hillshadeDirection);
 
-    this.colorOverlay.setOpacity(next.colorOpacity);
-    // The color/contour overlay is a flat 2D canvas (see MapterhornColorOverlay's
-    // docstring), so it is hidden whenever 3D terrain is on, or the map is in
-    // globe projection, to avoid it looking like a floating flat sheet.
+    // The contour overlay is a flat 2D canvas (see MapterhornContourOverlay's
+    // docstring), so it is hidden whenever 3D terrain is on, the map is in
+    // globe projection, or contours are toggled off.
     this.syncOverlayVisibility();
 
     if (next.terrain3d !== previous.terrain3d || next.exaggeration !== previous.exaggeration) {
@@ -142,19 +139,16 @@ export class MapterhornLayerManager {
       this.syncCameraPitch(next.terrain3d);
     }
 
-    const needsRecolor =
-      next.colorRamp !== previous.colorRamp ||
+    const needsRedraw =
       next.trimOutliers !== previous.trimOutliers ||
       next.outlierPercentile !== previous.outlierPercentile ||
       next.contours !== previous.contours ||
       next.contourInterval !== previous.contourInterval ||
       next.contourSmoothing !== previous.contourSmoothing;
-    if (needsRecolor) {
-      this.colorOverlay.invalidate({
-        getColorRamp: () => this.settings.colorRamp,
+    if (needsRedraw) {
+      this.contourOverlay.invalidate({
         getTrimOutliers: () => this.settings.trimOutliers,
         getOutlierPercentile: () => this.settings.outlierPercentile,
-        getContours: () => this.settings.contours,
         getContourInterval: () => this.settings.contourInterval,
         getContourSmoothing: () => this.settings.contourSmoothing,
       });
@@ -203,14 +197,16 @@ export class MapterhornLayerManager {
   }
 
   /**
-   * Recomputes the color/contour overlay's visibility from the current
-   * settings and map projection. The overlay is a flat 2D canvas (see
-   * `MapterhornColorOverlay`'s docstring), so it is only shown for flat,
-   * top-down mercator viewing — hidden for 3D terrain and for globe
-   * projection alike.
+   * Recomputes the contour overlay's visibility from the current settings
+   * and map projection. The overlay is a flat 2D canvas (see
+   * `MapterhornContourOverlay`'s docstring), so it is only shown when
+   * contours are toggled on **and** the view is flat, top-down mercator —
+   * hidden for 3D terrain and for globe projection alike.
    */
   private syncOverlayVisibility(): void {
-    this.colorOverlay.setVisible(this.settings.enabled && !this.settings.terrain3d && this.isFlatProjection());
+    this.contourOverlay.setVisible(
+      this.settings.enabled && this.settings.contours && !this.settings.terrain3d && this.isFlatProjection(),
+    );
   }
 
   private isFlatProjection(): boolean {

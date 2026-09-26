@@ -3,6 +3,6 @@
   "name": "Mapterhorn",
   "version": "0.1.0",
   "entry": "dist/index.js",
-  "description": "Live hillshade, vertical exaggeration, 3D terrain, contours, and outlier-trimmed hypsometric tinting from Mapterhorn global terrain tiles.",
+  "description": "Live hillshade, vertical exaggeration, 3D terrain, and contours from Mapterhorn global terrain tiles, with an outlier-trimmed elevation statistics readout.",
   "engines": ["maplibre"]
 }

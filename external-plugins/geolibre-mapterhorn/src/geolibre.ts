@@ -48,9 +48,9 @@ const plugin: GeoLibrePlugin = {
     // (only exaggeration/illumination-direction, both plugin-owned sliders in
     // the right panel), so this uses `paintMode: "plugin"` and only bridges
     // visibility — see docs/plugin-api.md's "Custom (WebGL) layers and paint
-    // ownership". The hypsometric color/contour overlay is a plain DOM canvas,
-    // not a MapLibre layer, so it has no separate Layers-panel entry; it is
-    // controlled entirely from this plugin's own right panel.
+    // ownership". The contour overlay is a plain DOM canvas, not a MapLibre
+    // layer, so it has no separate Layers-panel entry; it is controlled
+    // entirely from this plugin's own right panel.
     app.registerExternalNativeLayer?.({
       id: HILLSHADE_NATIVE_LAYER_ID,
       name: "Mapterhorn Hillshade",

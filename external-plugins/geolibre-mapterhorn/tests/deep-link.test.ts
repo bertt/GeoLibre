@@ -10,8 +10,6 @@ describe("encodeSettingsToUrlParams / decodeSettingsFromUrlParams", () => {
       hillshadeStrength: 0.8,
       hillshadeDirection: 200,
       terrain3d: true,
-      colorRamp: "viridis",
-      colorOpacity: 0.3,
       contours: true,
       contourInterval: 50,
       contourSmoothing: "strong" as const,
@@ -24,8 +22,6 @@ describe("encodeSettingsToUrlParams / decodeSettingsFromUrlParams", () => {
     expect(decoded.hillshadeStrength).toBe(0.8);
     expect(decoded.hillshadeDirection).toBe(200);
     expect(decoded.terrain3d).toBe(true);
-    expect(decoded.colorRamp).toBe("viridis");
-    expect(decoded.colorOpacity).toBe(0.3);
     expect(decoded.contours).toBe(true);
     expect(decoded.contourInterval).toBe(50);
     expect(decoded.contourSmoothing).toBe("strong");
