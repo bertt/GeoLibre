@@ -25,13 +25,30 @@ export const MAPTERHORN_HILLSHADE_LAYER_ID = "mapterhorn-hillshade-layer";
  *   hypsometric color tinting and contour lines, which MapLibre has no
  *   native support for (see that class's docstring for why this is a DOM
  *   overlay rather than a MapLibre source/layer). Because it is a flat 2D
- *   overlay, it is hidden whenever 3D terrain is enabled.
+ *   overlay, it is hidden whenever 3D terrain is enabled, **and whenever the
+ *   map is in globe projection** (a flat rectangle can't be wrapped onto a
+ *   sphere; without this it renders as a flat plane floating in front of/
+ *   behind the globe). Visibility is re-checked on MapLibre's
+ *   `projectiontransition` event, which fires whenever the user toggles
+ *   GeoLibre's globe control.
+ *
+ * Enabling 3D terrain also tilts the camera (`map.easeTo({ pitch: 60 })`) if
+ * it is currently close to top-down: elevation displacement on a globe/map
+ * pushes terrain outward along the local "up" vector, which is invisible
+ * from directly overhead — it only reads as "real mountains" once the
+ * camera looks across the relief rather than straight down. Only a pitch
+ * this class itself introduced is ever restored on disable (see
+ * `pitchedByPlugin`), so it never fights a pitch the user set by hand.
  */
 export class MapterhornLayerManager {
   private readonly map: MapLibreMap;
   private settings: MapterhornSettings;
   private readonly colorOverlay: MapterhornColorOverlay;
   private added = false;
+  /** Tracks whether `applyTerrain()` tilted the camera, so disabling 3D terrain only restores the pitch this plugin itself introduced (never fights a pitch the user set by hand). */
+  private pitchedByPlugin = false;
+
+  private readonly onProjectionTransition = (): void => this.syncOverlayVisibility();
 
   constructor(map: MapLibreMap, settings: MapterhornSettings, onStatsUpdated: (stats: OutlierTrimResult) => void) {
     this.map = map;
@@ -74,16 +91,19 @@ export class MapterhornLayerManager {
 
     this.colorOverlay.mount();
     this.colorOverlay.setOpacity(this.settings.colorOpacity);
-    this.colorOverlay.setVisible(this.settings.enabled && !this.settings.terrain3d);
 
     this.added = true;
+    this.syncOverlayVisibility();
+    this.map.on("projectiontransition", this.onProjectionTransition);
     this.applyTerrain();
+    this.syncCameraPitch(this.settings.terrain3d);
   }
 
   /** Removes all sources/layers/terrain/overlay added by `mount()`. */
   unmount(): void {
     if (!this.added) return;
     const { map } = this;
+    map.off("projectiontransition", this.onProjectionTransition);
     if (map.getTerrain()?.source === MAPTERHORN_DEM_SOURCE_ID) map.setTerrain(null);
     this.colorOverlay.unmount();
     if (map.getLayer(MAPTERHORN_HILLSHADE_LAYER_ID)) map.removeLayer(MAPTERHORN_HILLSHADE_LAYER_ID);
@@ -111,12 +131,15 @@ export class MapterhornLayerManager {
 
     this.colorOverlay.setOpacity(next.colorOpacity);
     // The color/contour overlay is a flat 2D canvas (see MapterhornColorOverlay's
-    // docstring), so it is hidden whenever 3D terrain is on to avoid it looking
-    // like a floating flat sheet over the pitched relief.
-    this.colorOverlay.setVisible(next.enabled && !next.terrain3d);
+    // docstring), so it is hidden whenever 3D terrain is on, or the map is in
+    // globe projection, to avoid it looking like a floating flat sheet.
+    this.syncOverlayVisibility();
 
     if (next.terrain3d !== previous.terrain3d || next.exaggeration !== previous.exaggeration) {
       this.applyTerrain();
+    }
+    if (next.terrain3d !== previous.terrain3d) {
+      this.syncCameraPitch(next.terrain3d);
     }
 
     const needsRecolor =
@@ -157,5 +180,40 @@ export class MapterhornLayerManager {
     } else if (map.getTerrain()?.source === MAPTERHORN_DEM_SOURCE_ID) {
       map.setTerrain(null);
     }
+  }
+
+  /**
+   * Tilts the camera when 3D terrain is enabled (so displaced relief is
+   * actually visible, rather than foreshortened to nothing when looking
+   * straight down), and restores the pitch on disable — but only the pitch
+   * this method itself introduced, so a manual pitch the user set is never
+   * overridden or clobbered.
+   */
+  private syncCameraPitch(terrain3d: boolean): void {
+    const { map } = this;
+    if (terrain3d) {
+      if (map.getPitch() < 20) {
+        this.pitchedByPlugin = true;
+        map.easeTo({ pitch: 60, duration: 600 });
+      }
+    } else if (this.pitchedByPlugin) {
+      this.pitchedByPlugin = false;
+      map.easeTo({ pitch: 0, duration: 600 });
+    }
+  }
+
+  /**
+   * Recomputes the color/contour overlay's visibility from the current
+   * settings and map projection. The overlay is a flat 2D canvas (see
+   * `MapterhornColorOverlay`'s docstring), so it is only shown for flat,
+   * top-down mercator viewing — hidden for 3D terrain and for globe
+   * projection alike.
+   */
+  private syncOverlayVisibility(): void {
+    this.colorOverlay.setVisible(this.settings.enabled && !this.settings.terrain3d && this.isFlatProjection());
+  }
+
+  private isFlatProjection(): boolean {
+    return (this.map.getProjection?.()?.type ?? "mercator") === "mercator";
   }
 }

@@ -32,7 +32,7 @@ export const DEFAULT_SETTINGS: MapterhornSettings = {
   exaggeration: 1.5,
   hillshadeStrength: 0.5,
   hillshadeDirection: 315,
-  terrain3d: false,
+  terrain3d: true,
   colorRamp: "terrain",
   colorOpacity: 0.6,
   contours: false,
