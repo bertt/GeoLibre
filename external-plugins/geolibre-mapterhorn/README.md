@@ -1,4 +1,4 @@
-# Mapterhorn Terrain — a GeoLibre plugin
+# Mapterhorn — a GeoLibre plugin
 
 An external [GeoLibre](https://github.com/opengeos/geolibre) plugin that
 recreates the core functionality of
@@ -7,7 +7,7 @@ with vertical exaggeration, optional 3D terrain, hypsometric (elevation)
 color tinting with outlier-trimmed color scaling, and contour lines — all
 from [Mapterhorn](https://mapterhorn.com)'s free, global terrain tiles.
 
-Plugin id: `geolibre-mapterhorn` · Display name: **Mapterhorn Terrain**.
+Plugin id: `geolibre-mapterhorn` · Display name: **Mapterhorn**.
 
 ## What it does
 
@@ -96,7 +96,7 @@ conventions, so it installs the same way any external GeoLibre plugin does.
 
 ## Activate
 
-Open GeoLibre's **Plugins** menu and enable **Mapterhorn Terrain**. A small
+Open GeoLibre's **Plugins** menu and enable **Mapterhorn**. A small
 toolbar button appears on the map (top-right by default); click it to
 open/close the plugin's right-sidebar panel with all the sliders and
 toggles described above.

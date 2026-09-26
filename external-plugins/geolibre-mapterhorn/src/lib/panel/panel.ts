@@ -224,6 +224,20 @@ function injectStyleOnce(): void {
 .${CSS_PREFIX}-slider { flex-direction: column; align-items: stretch; gap: 2px; }
 .${CSS_PREFIX}-slider-label { display: flex; justify-content: space-between; }
 .${CSS_PREFIX}-select { justify-content: space-between; }
+.${CSS_PREFIX}-select select {
+  /* Explicit, host-independent colors: the host panel's own text/background
+     rules only style this <select>'s closed box, not the native dropdown
+     popup the browser renders for its options (which otherwise inherits a
+     dark theme's white text over its own light system background, making
+     every option invisible). color-scheme pins that popup to a normal
+     light rendering everywhere, matching these explicit colors. */
+  color-scheme: light;
+  background: #ffffff;
+  color: #111111;
+  border: 1px solid #c9ccd1;
+  border-radius: 4px;
+  padding: 2px 6px;
+}
 .${CSS_PREFIX}-stats { margin-top: 8px; font-size: 12px; opacity: 0.75; line-height: 1.4; }
 `.trim();
   document.head.appendChild(style);

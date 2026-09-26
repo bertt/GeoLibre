@@ -19,8 +19,8 @@ export class MapterhornControl implements IControl {
 
     const button = document.createElement("button");
     button.type = "button";
-    button.setAttribute("aria-label", "Mapterhorn Terrain");
-    button.title = "Mapterhorn Terrain";
+    button.setAttribute("aria-label", "Mapterhorn");
+    button.title = "Mapterhorn";
     button.innerHTML =
       '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" ' +
       'stroke-linecap="round" stroke-linejoin="round"><path d="M3 20 L9 9 L13 15 L16 10 L21 20 Z"/></svg>';

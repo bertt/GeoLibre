@@ -1,6 +1,6 @@
 {
   "id": "geolibre-mapterhorn",
-  "name": "Mapterhorn Terrain",
+  "name": "Mapterhorn",
   "version": "0.1.0",
   "entry": "dist/index.js",
   "description": "Live hillshade, vertical exaggeration, 3D terrain, contours, and outlier-trimmed hypsometric tinting from Mapterhorn global terrain tiles.",

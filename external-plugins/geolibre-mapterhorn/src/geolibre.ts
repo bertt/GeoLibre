@@ -26,7 +26,7 @@ function applySettings(app: GeoLibreAppAPI, patch: Partial<MapterhornSettings>):
 
 const plugin: GeoLibrePlugin = {
   id: PLUGIN_ID,
-  name: "Mapterhorn Terrain",
+  name: "Mapterhorn",
   version: "0.1.0",
   urlParameterNames: MAPTERHORN_URL_PARAMETER_NAMES,
 
@@ -80,7 +80,7 @@ const plugin: GeoLibrePlugin = {
     unregisterRightPanel =
       app.registerRightPanel?.({
         id: RIGHT_PANEL_ID,
-        title: "Mapterhorn Terrain",
+        title: "Mapterhorn",
         defaultWidth: 300,
         render: (container) => {
           panelHandle = renderMapterhornPanel(container, settings, (patch) => applySettings(app, patch));
