@@ -19,9 +19,12 @@ Plugin id: `geolibre-mapterhorn` · Display name: **Mapterhorn Terrain**.
 - **3D terrain** — toggle pitched/extruded terrain (native MapLibre terrain).
 - **Hypsometric color tinting** — a color ramp (`VECTOR_COLOR_RAMPS`, copied
   from `@geolibre/core`'s pure `color-ramp.ts` — see "Code reuse" below)
-  applied to decoded elevation, rendered through a custom
-  MapLibre `type: "custom"` raster source (Mapterhorn's terrarium-encoded
-  tiles have no native color-ramp support).
+  applied to decoded elevation, rendered as a `map.project()`-synced 2D
+  canvas overlay (Mapterhorn's terrarium-encoded tiles have no native
+  color-ramp support, and MapLibre GL JS has no `type: "custom"` **source** —
+  see `color-overlay.ts`'s docstring). This overlay is a flat 2D layer, so it
+  is automatically hidden whenever 3D terrain is on (3D mode shows hillshade
+  + terrain only).
 - **Outlier trimming** — percentile-based min/max clipping of the color
   scale (default on, 2%), with a live elevation-statistics readout.
 - **Contours** — optional contour lines (marching squares) with interval and
@@ -116,15 +119,19 @@ toggles described above.
   2. Move the **vertical exaggeration** and **hillshade strength/direction**
      sliders; confirm the shading updates live.
   3. Toggle **3D terrain**; confirm the map tilts/extrudes and follows the
-     exaggeration slider.
-  4. Change the **color ramp** and **color opacity**; confirm the tint
+     exaggeration slider, and that the hypsometric color/contour overlay
+     hides itself while 3D is on (it is a flat 2D canvas synced via
+     `map.project()`, so it only makes sense for a top-down view — see
+     `color-overlay.ts`'s docstring).
+  4. Toggle 3D back off; confirm the color/contour overlay reappears.
+  5. Change the **color ramp** and **color opacity**; confirm the tint
      updates (tiles briefly re-render).
-  5. Toggle **contours** on; adjust **interval** and **smoothing**; confirm
+  6. Toggle **contours** on; adjust **interval** and **smoothing**; confirm
      lines redraw at the new interval.
-  6. Toggle **trim outliers** off/on and move the **outlier percentile**
+  7. Toggle **trim outliers** off/on and move the **outlier percentile**
      slider; confirm the color scale and the elevation-statistics readout
      (`Observed: … • Color scale: … • Samples: …`) update.
-  7. Deactivate and reactivate the plugin; confirm settings persist through
+  8. Deactivate and reactivate the plugin; confirm settings persist through
      the project's saved state (`getProjectState`/`applyProjectState`).
 
 ## Desktop CSP note
@@ -144,6 +151,16 @@ to add the host, or use the web build (unaffected by this restriction).
   no seafloor mode, grid overlay, or share links — cosmetic extras from the
   original Relief app, out of scope for v1.
 - MapLibre-only (`engines: ["maplibre"]`) — no Cesium/Mapbox/ArcGIS support.
+- **Expected 404s over open ocean**: Mapterhorn only publishes tiles over
+  landmass (confirmed by probing `tiles.mapterhorn.com` directly — the same
+  `z/x/y` returns `200` over the Netherlands and `404` over open ocean at
+  higher zooms). Both the native `raster-dem` source and this plugin's color
+  overlay fetch the same tiles, so panning/zooming over open water logs
+  harmless 404s in GeoLibre's network diagnostics; this is inherent to
+  Mapterhorn's coverage, not a plugin bug.
+- The color/contour overlay is a flat, unprojected 2D canvas (see
+  `color-overlay.ts`'s docstring) — it does not handle the antimeridian and
+  is hidden whenever 3D terrain is on.
 
 ## Code reuse
 
@@ -184,8 +201,9 @@ external-plugins/geolibre-mapterhorn/
         outlier-stats.ts           # running histogram + percentile trim (pure)
         contours.ts                # marching-squares contour extraction + smoothing (pure)
         settings.ts                # MapterhornSettings type, defaults, clamping
-        color-source.ts            # custom MapLibre raster source: color ramp + contours
-        layer-manager.ts           # wires raster-dem/hillshade/terrain + the color source
+        color-ramp.ts             # color ramp definitions/interpolation (pure, copied from @geolibre/core)
+        color-overlay.ts          # map.project()-synced 2D canvas overlay: color ramp + contours
+        layer-manager.ts           # wires raster-dem/hillshade/terrain + the color overlay
         control.ts                 # minimal map control (toggles the right panel)
       panel/panel.ts               # right-sidebar DOM UI
       utils/deep-link.ts           # URL query-parameter round-trip
