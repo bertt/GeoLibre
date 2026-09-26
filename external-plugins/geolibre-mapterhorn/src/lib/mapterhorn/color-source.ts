@@ -1,4 +1,4 @@
-import { getVectorColorRamp, interpolateColors, parseHexColor } from "@geolibre/core";
+import { getVectorColorRamp, interpolateColors, parseHexColor } from "./color-ramp";
 import { decodeTerrariumImage, mapterhornTileUrl, MAPTERHORN_TILE_SIZE, MAPTERHORN_MAX_ZOOM } from "./terrarium";
 import { computeOutlierTrim, ElevationHistogramAccumulator, type OutlierTrimResult } from "./outlier-stats";
 import { extractContours, smoothGrid, type ContourSmoothing } from "./contours";

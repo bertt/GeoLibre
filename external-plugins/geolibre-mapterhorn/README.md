@@ -17,8 +17,9 @@ Plugin id: `geolibre-mapterhorn` · Display name: **Mapterhorn Terrain**.
   drives `map.setTerrain({ exaggeration })` directly, in 2D it approximates
   via the hillshade layer's exaggeration paint property.
 - **3D terrain** — toggle pitched/extruded terrain (native MapLibre terrain).
-- **Hypsometric color tinting** — a color ramp (reusing `@geolibre/core`'s
-  built-in ramps) applied to decoded elevation, rendered through a custom
+- **Hypsometric color tinting** — a color ramp (`VECTOR_COLOR_RAMPS`, copied
+  from `@geolibre/core`'s pure `color-ramp.ts` — see "Code reuse" below)
+  applied to decoded elevation, rendered through a custom
   MapLibre `type: "custom"` raster source (Mapterhorn's terrarium-encoded
   tiles have no native color-ramp support).
 - **Outlier trimming** — percentile-based min/max clipping of the color
@@ -139,10 +140,36 @@ to add the host, or use the web build (unaffected by this restriction).
 - Single elevation source (Mapterhorn) — no WCS/PDOK integration, no
   World/Netherlands datasource toggle (dropped from the original request's
   scope by explicit follow-up decision).
-- No palette picker beyond `@geolibre/core`'s built-in ramps, no seafloor
-  mode, grid overlay, or share links — cosmetic extras from the original
-  Relief app, out of scope for v1.
+- No palette picker beyond the built-in ramps (`src/lib/mapterhorn/color-ramp.ts`),
+  no seafloor mode, grid overlay, or share links — cosmetic extras from the
+  original Relief app, out of scope for v1.
 - MapLibre-only (`engines: ["maplibre"]`) — no Cesium/Mapbox/ArcGIS support.
+
+## Code reuse
+
+The plugin has **no runtime dependency on `@geolibre/core`**. Two small, pure
+modules were copied in from the monorepo instead of imported as npm
+dependencies, so the plugin stays a single self-contained bundle that a
+browser can `import()` with no import map:
+
+- `src/lib/mapterhorn/color-ramp.ts` — copied from
+  `packages/core/src/color-ramp.ts` (`VECTOR_COLOR_RAMPS`,
+  `getVectorColorRamp`, `interpolateColors`, `parseHexColor`, etc.).
+  `@geolibre/core`'s single barrel export (`@geolibre/core`) also re-exports
+  its Zustand-backed app store, which pulls in `react` as a peer dependency.
+  Rollup happily externalizes/tree-shakes that in the monorepo's Vite app
+  (which does have `react` installed), but this plugin is a standalone
+  bundle with no `react` in its own `node_modules` and no browser import map
+  at load time — importing anything from `@geolibre/core` broke plugin
+  loading at runtime with `Could not resolve "react" imported by "zustand"`.
+  Keep this file in sync by hand if the upstream ramp definitions change.
+- `src/lib/mapterhorn/outlier-stats.ts` — percentile/histogram math ported
+  from `packages/plugins/src/plugins/raster-symbology.ts` (a `private`
+  workspace package, not published to npm, so it could not be a dependency
+  either way).
+
+If this plugin is later extracted to its own repository, both files are
+already fully self-contained and need no further changes.
 
 ## Repository layout
 

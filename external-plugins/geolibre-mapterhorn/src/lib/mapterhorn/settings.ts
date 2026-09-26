@@ -12,7 +12,7 @@ export type MapterhornSettings = {
   hillshadeDirection: number;
   /** Pitched 3D terrain mode (`map.setTerrain(...)`) vs. flat 2D shading. */
   terrain3d: boolean;
-  /** Hypsometric color ramp name, from `@geolibre/core`'s `VECTOR_COLOR_RAMPS`. */
+  /** Hypsometric color ramp name, from `./color-ramp`'s `VECTOR_COLOR_RAMPS`. */
   colorRamp: string;
   /** Opacity (0-1) of the hypsometric color-tint layer over the hillshade. */
   colorOpacity: number;

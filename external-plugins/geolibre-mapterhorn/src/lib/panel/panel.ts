@@ -1,4 +1,4 @@
-import { VECTOR_COLOR_RAMPS } from "@geolibre/core";
+import { VECTOR_COLOR_RAMPS } from "../mapterhorn/color-ramp";
 import { SETTINGS_LIMITS, type MapterhornSettings } from "../mapterhorn/settings";
 import type { OutlierTrimResult } from "../mapterhorn/outlier-stats";
 
