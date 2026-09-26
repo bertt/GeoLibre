@@ -49,24 +49,51 @@ export interface GeoLibreNativeLayerStyle {
  * {@link GeoLibreAppAPI.registerExternalNativeLayer}. It lets GeoLibre own the
  * MapLibre sources and layers (so they appear in the host's layer panel and
  * respect its theme) while the plugin supplies the data and styling.
+ *
+ * Extended beyond the template's original (`opacity`/`style`/`sourceIds`
+ * required) shape to match the real host contract documented in
+ * `docs/plugin-api.md`'s "Custom (WebGL) layers and paint ownership": a
+ * plugin that paints its own layer (a `CustomLayerInterface`, or here a
+ * native layer with no generic opacity paint property) sets
+ * `paintMode: "plugin"` and forwards live Layers-panel toggles through
+ * `paintBridge` instead of GeoLibre owning paint properties it cannot reach.
  */
 export interface GeoLibreNativeLayerRegistration {
   /** Stable, plugin-unique id used later to unregister the layer. */
   id: string;
   /** Human-readable name shown in the host's layer list. */
   name: string;
+  /** Closest built-in layer type for the Layers panel, e.g. "raster". */
+  type?: string;
   /** Optional inline data; omit when the host already has the source. */
   geojson?: GeoLibreFeatureCollection;
   /** MapLibre layer ids the host should create or adopt. */
   nativeLayerIds: string[];
-  /** MapLibre source ids backing the layers above. */
-  sourceIds: string[];
+  /** MapLibre source id backing the layer(s) above (single-source form). */
+  sourceId?: string;
+  /** MapLibre source ids backing the layers above (multi-source form). */
+  sourceIds?: string[];
   /** Initial layer opacity in the range 0..1. */
-  opacity: number;
+  opacity?: number;
   /** Styling hints applied to the rendered layer. */
-  style: GeoLibreNativeLayerStyle;
+  style?: GeoLibreNativeLayerStyle;
   /** Arbitrary extra data the host may persist or display. */
   metadata?: Record<string, unknown>;
+  /**
+   * `"plugin"` tells the Style panel the plugin paints this layer, so it
+   * shows only controls that actually apply (visibility, reordering,
+   * zoom range, and — with a `paintBridge` — opacity) instead of paint
+   * sliders that would silently do nothing. Defaults to `"geolibre"`.
+   */
+  paintMode?: "geolibre" | "plugin";
+  /**
+   * Setters the host calls when the user changes opacity/visibility from
+   * the Layers or Style panel. Supplying either implies `paintMode: "plugin"`.
+   */
+  paintBridge?: {
+    setOpacity?: (opacity: number) => void;
+    setVisibility?: (visible: boolean) => void;
+  };
 }
 
 /**

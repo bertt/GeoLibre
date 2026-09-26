@@ -138,6 +138,18 @@ export class MapterhornLayerManager {
     }
   }
 
+  /**
+   * Sets the native hillshade layer's visibility directly, independent of
+   * the plugin's own `enabled` setting. This is the bridge target for
+   * `registerExternalNativeLayer`'s `paintBridge.setVisibility`, so the
+   * Layers panel's own eye-icon toggle for this layer works like it does for
+   * any other native layer.
+   */
+  setHillshadeVisible(visible: boolean): void {
+    if (!this.added) return;
+    this.map.setLayoutProperty(MAPTERHORN_HILLSHADE_LAYER_ID, "visibility", visible ? "visible" : "none");
+  }
+
   private applyTerrain(): void {
     const { map, settings } = this;
     if (settings.terrain3d) {

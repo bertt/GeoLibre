@@ -1,6 +1,6 @@
 import type { GeoLibreAppAPI, GeoLibrePlugin } from "./lib/geolibre/host-api";
 import { MapterhornControl } from "./lib/mapterhorn/control";
-import { MapterhornLayerManager } from "./lib/mapterhorn/layer-manager";
+import { MAPTERHORN_DEM_SOURCE_ID, MAPTERHORN_HILLSHADE_LAYER_ID, MapterhornLayerManager } from "./lib/mapterhorn/layer-manager";
 import { DEFAULT_SETTINGS, normalizeSettings, type MapterhornSettings } from "./lib/mapterhorn/settings";
 import { renderMapterhornPanel, type MapterhornPanelHandle } from "./lib/panel/panel";
 import {
@@ -11,6 +11,7 @@ import {
 
 const PLUGIN_ID = "geolibre-mapterhorn";
 const RIGHT_PANEL_ID = "geolibre-mapterhorn-panel";
+const HILLSHADE_NATIVE_LAYER_ID = "geolibre-mapterhorn-hillshade";
 
 let settings: MapterhornSettings = { ...DEFAULT_SETTINGS };
 let control: MapterhornControl | null = null;
@@ -41,6 +42,27 @@ const plugin: GeoLibrePlugin = {
     layerManager = new MapterhornLayerManager(map, settings, (stats) => panelHandle?.setStats(stats));
     layerManager.mount();
 
+    // Mirror the native hillshade layer into GeoLibre's Layers panel so it
+    // shows up like any other layer (visibility toggle, reordering). The
+    // hillshade MapLibre layer type has no generic opacity paint property
+    // (only exaggeration/illumination-direction, both plugin-owned sliders in
+    // the right panel), so this uses `paintMode: "plugin"` and only bridges
+    // visibility — see docs/plugin-api.md's "Custom (WebGL) layers and paint
+    // ownership". The hypsometric color/contour overlay is a plain DOM canvas,
+    // not a MapLibre layer, so it has no separate Layers-panel entry; it is
+    // controlled entirely from this plugin's own right panel.
+    app.registerExternalNativeLayer?.({
+      id: HILLSHADE_NATIVE_LAYER_ID,
+      name: "Mapterhorn Hillshade",
+      type: "raster",
+      nativeLayerIds: [MAPTERHORN_HILLSHADE_LAYER_ID],
+      sourceId: MAPTERHORN_DEM_SOURCE_ID,
+      paintMode: "plugin",
+      paintBridge: {
+        setVisibility: (visible) => layerManager?.setHillshadeVisible(visible),
+      },
+    });
+
     control = new MapterhornControl(() => {
       const active = app.getActiveRightPanel?.() === RIGHT_PANEL_ID;
       if (active) app.closeRightPanel?.(RIGHT_PANEL_ID);
@@ -48,6 +70,7 @@ const plugin: GeoLibrePlugin = {
     });
     const added = app.addMapControl(control, "top-right");
     if (!added) {
+      app.unregisterExternalNativeLayer?.(HILLSHADE_NATIVE_LAYER_ID);
       layerManager.unmount();
       layerManager = null;
       control = null;
@@ -79,6 +102,7 @@ const plugin: GeoLibrePlugin = {
       control = null;
     }
 
+    app.unregisterExternalNativeLayer?.(HILLSHADE_NATIVE_LAYER_ID);
     layerManager?.unmount();
     layerManager = null;
   },
