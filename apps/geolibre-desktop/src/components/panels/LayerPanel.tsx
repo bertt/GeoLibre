@@ -24,7 +24,7 @@ import {
 } from "@geolibre/core";
 import type { EllipsoidId, GeoLibreLayer, LayerGroup } from "@geolibre/core";
 import { getTemporalLayersVersion, subscribeTemporalLayers } from "@geolibre/plugins";
-import type { MapEngine } from "@geolibre/map";
+import { rendererCapabilities, type MapEngine } from "@geolibre/map";
 import { getIsMobileViewport } from "../../hooks/useIsMobileViewport";
 import type { ThemeMode } from "../../hooks/useThemeMode";
 import { usePluginRegistry } from "../../hooks/usePlugins";
@@ -45,6 +45,7 @@ import { BackgroundAppearanceDialog, BackgroundLayerRow } from "./layer-panel/Ba
 import { BindTimeSliderDialog } from "./layer-panel/BindTimeSliderDialog";
 import type { LayerActionsMenuShared } from "./layer-panel/LayerActionsMenu";
 import { LayerGroupHeader } from "./layer-panel/LayerGroupHeader";
+import { LayerHoverControls } from "./layer-panel/LayerHoverControls";
 import { LayerMetadataDialog, useLayerMetadataDialog } from "./layer-panel/LayerMetadataDialog";
 import { LayerPanelHeader } from "./layer-panel/LayerPanelHeader";
 import { LayerRow } from "./layer-panel/LayerRow";
@@ -55,14 +56,16 @@ import {
 import { RemoveLayerDialog } from "./layer-panel/RemoveLayerDialog";
 import { useLayerActions } from "./layer-panel/useLayerActions";
 import { useLayerDragAndDrop } from "./layer-panel/useLayerDragAndDrop";
-import { useLayerRefresh } from "./layer-panel/useLayerRefresh";
+import type { LayerRefresh } from "./layer-panel/useLayerRefresh";
 import { useLayerRename } from "./layer-panel/useLayerRename";
 import { useLayerSelection } from "./layer-panel/useLayerSelection";
 import { useTimeSliderBinding } from "./layer-panel/useTimeSliderBinding";
+import { setLayersPanelCollapsed } from "../../lib/layer-panel-collapse";
 
 interface LayerPanelProps {
   themeMode: ThemeMode;
   mapControllerRef: RefObject<MapEngine | null>;
+  refresh: LayerRefresh;
   collaborationApi?: CollaborationApi;
   onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
   /** Id of the layer currently in a geometry-edit session, or null. */
@@ -114,6 +117,7 @@ interface LayerPanelProps {
 export function LayerPanel({
   themeMode,
   mapControllerRef,
+  refresh,
   collaborationApi,
   onResizeStart,
   geometryEditLayerId,
@@ -134,30 +138,39 @@ export function LayerPanel({
   );
   const uiProfile = useDesktopSettingsStore((s) => s.desktopSettings.uiProfile);
   // Same visibility rules the Add Data menu applies (profile, Mac App Store,
-  // and the mobile-only postgres rule); the user agent is stable for the
+  // and the mobile-only database rule); the user agent is stable for the
   // session, so evaluate it once.
   const mobile = useMemo(() => isMobile(), []);
-  const arcgisPrimary = useAppStore((s) => s.primaryRenderer === "arcgis");
+  // PMTiles, raster and Zarr are added through their own panels where those
+  // can mount, so the Add Data group lists their forms only where they cannot.
+  const controlLayerPanels = useAppStore(
+    (s) => rendererCapabilities(s.primaryRenderer).controlLayerPanels,
+  );
   const addDataGroupSources = useMemo(
     () =>
       ADD_DATA_DIALOG_SOURCES.filter(
         (entry) =>
           isDataSourceVisible(uiProfile, entry.id) &&
-          (!["pmtiles", "raster", "zarr"].includes(entry.id) || arcgisPrimary) &&
-          !(entry.id === "postgres" && mobile) &&
+          (!["pmtiles", "raster", "zarr"].includes(entry.id) || !controlLayerPanels) &&
+          !((entry.id === "postgres" || entry.id === "mssql") && mobile) &&
           !masHidesDataSource(entry.id),
       ),
-    [uiProfile, mobile, arcgisPrimary],
+    [uiProfile, mobile, controlLayerPanels],
   );
   const layers = useAppStore((s) => s.layers);
   const layerGroups = useAppStore((s) => s.layerGroups);
   // The 3D globe draws a subset of the layer kinds MapLibre does, so rows it
   // cannot render are flagged while it owns the primary map area (#2217).
+  // eslint-disable-next-line local/no-renderer-kind-checks -- selects the engine's layer support table
   const cesiumPrimary = useAppStore((s) => s.primaryRenderer === "cesium");
   // Likewise the Mapbox engine only compiles native Mapbox sources, so a layer
   // it rejects (a MapLibre custom protocol, deck.gl, COG, ...) is flagged here
   // rather than only reported by the map's error banner once it is visible.
+  // eslint-disable-next-line local/no-renderer-kind-checks -- selects the engine's layer support table
   const mapboxPrimary = useAppStore((s) => s.primaryRenderer === "mapbox");
+  // Same for the ArcGIS view's support table.
+  // eslint-disable-next-line local/no-renderer-kind-checks -- selects the engine's layer support table
+  const arcgisPrimary = useAppStore((s) => s.primaryRenderer === "arcgis");
   // The subset panel draws its extract box on the map surface, so it needs an
   // engine the user can draw on — not merely "not the globe".
   const capabilities = useMapCapabilities(mapControllerRef);
@@ -175,6 +188,7 @@ export function LayerPanel({
   const applyPlanetaryBasemap = useAppStore((s) => s.applyPlanetaryBasemap);
   const restoreEarthBasemap = useAppStore((s) => s.restoreEarthBasemap);
   const basemapStyleUrl = useAppStore((s) =>
+    // eslint-disable-next-line local/no-renderer-kind-checks -- Mapbox keeps its own persisted style URL
     s.primaryRenderer === "mapbox"
       ? (s.preferences.map.mapboxStyleUrl ?? s.basemapStyleUrl)
       : s.basemapStyleUrl,
@@ -269,6 +283,11 @@ export function LayerPanel({
   // ref starts as null (not `autoCollapse`) so a mount with `autoCollapse`
   // already true reads as a null→true transition and still collapses. Skipped in
   // controlled mode, where the parent (shared rail) owns collapse.
+  // Publish the collapse state for Export as HTML (see layer-panel-collapse).
+  useEffect(() => {
+    setLayersPanelCollapsed(isCollapsed);
+    return () => setLayersPanelCollapsed(false);
+  }, [isCollapsed]);
   const prevAutoCollapse = useRef<boolean | null>(null);
   const collapsedBeforeAuto = useRef(internalCollapsed);
   useEffect(() => {
@@ -292,13 +311,13 @@ export function LayerPanel({
     selectOnlyLayer: selection.selectOnlyLayer,
   });
   const rename = useLayerRename(layers, layerGroups);
-  const refresh = useLayerRefresh({ layers, isCollapsed });
   const actions = useLayerActions({
     mapControllerRef,
     canEditLayer,
     setRefreshStatuses: refresh.setRefreshStatuses,
     clearRefreshStatusTimer: refresh.clearRefreshStatusTimer,
     scheduleStatusClear: refresh.scheduleStatusClear,
+    markMssqlRefreshRequired: refresh.markMssqlRefreshRequired,
     isPluginActive,
     togglePlugin,
   });
@@ -408,8 +427,6 @@ export function LayerPanel({
         moveTargets={groupMoveTargets(group)}
         addDataGroupSources={addDataGroupSources}
         rename={rename}
-        onDragOver={drag.handleGroupHeaderDragOver}
-        onDrop={drag.handleGroupHeaderDrop}
       />
     );
   };
@@ -491,19 +508,22 @@ export function LayerPanel({
         className="absolute -end-1 top-0 z-20 hidden h-full w-2 cursor-col-resize touch-none select-none border-e border-transparent hover:border-primary md:block"
         onPointerDown={onResizeStart}
       />
-      <LayerPanelHeader
-        mapControllerRef={mapControllerRef}
-        selectedPlanet={selectedPlanet}
-        togglePlanet={togglePlanet}
-        isPluginActive={isPluginActive}
-        togglePlugin={togglePlugin}
-        onCreateGroup={rename.handleCreateGroup}
-        allLayersVisible={allLayersVisible}
-        onToggleAllLayers={toggleAllLayers}
-        geometryEditLayerId={geometryEditLayerId}
-        identifyLayerId={identifyLayerId}
-        onCollapse={() => setIsCollapsed(true)}
-      />
+      <div>
+        <LayerPanelHeader
+          mapControllerRef={mapControllerRef}
+          selectedPlanet={selectedPlanet}
+          togglePlanet={togglePlanet}
+          isPluginActive={isPluginActive}
+          togglePlugin={togglePlugin}
+          onCreateGroup={rename.handleCreateGroup}
+          allLayersVisible={allLayersVisible}
+          onToggleAllLayers={toggleAllLayers}
+          geometryEditLayerId={geometryEditLayerId}
+          identifyLayerId={identifyLayerId}
+          onCollapse={() => setIsCollapsed(true)}
+        />
+        <LayerHoverControls className="border-b px-3 py-1.5" />
+      </div>
       <ScrollArea
         className="min-h-0 [&_[data-radix-scroll-area-viewport]]:touch-pan-y [&_[data-radix-scroll-area-viewport]]:overscroll-contain [&_[data-radix-scroll-area-viewport]>div]:block! [&_[data-radix-scroll-area-viewport]>div]:w-full! [&_[data-radix-scroll-area-viewport]>div]:min-w-0!"
         // Radix measures scroll content with an injected display:table
@@ -515,12 +535,19 @@ export function LayerPanel({
         // legacy iOS property that does nothing on the Android WebView this fix
         // targets.
       >
-        <div className="w-full min-w-0 space-y-1 p-2">
-          {layers.length === 0 && (
-            <p className="px-2 py-4 text-xs text-muted-foreground">
-              {isBeginnerProfile ? t("layers.emptyBeginner") : t("layers.empty")}
-            </p>
-          )}
+        {layers.length === 0 && (
+          <p className="px-4 pb-2 pt-6 text-xs text-muted-foreground">
+            {isBeginnerProfile ? t("layers.emptyBeginner") : t("layers.empty")}
+          </p>
+        )}
+        {/* Rows, group headers and the Background card are listitems carrying
+            their nesting depth as aria-level. */}
+        <div
+          data-layer-list=""
+          role="list"
+          aria-label={t("sharedRail.layers")}
+          className="w-full min-w-0 space-y-1 p-2"
+        >
           {visibleLayers.map((layer, displayIndex) => {
             const group = layer.groupId ? groupById.get(layer.groupId) : undefined;
             const groupCollapsed = group?.collapsed ?? false;
@@ -541,12 +568,11 @@ export function LayerPanel({
                     dragged={drag.draggedLayerId === layer.id}
                     dropTarget={drag.dropTargetLayerId === layer.id}
                     draggedDisplayIndex={drag.draggedDisplayIndex}
-                    onDragStart={drag.handleLayerDragStart}
-                    onDragOver={drag.handleLayerDragOver}
-                    onDrop={drag.handleLayerDrop}
-                    onDragEnd={drag.resetDragState}
+                    onPointerDown={drag.handlePointerDown}
+                    onPointerMove={drag.handlePointerMove}
+                    onPointerUp={drag.handlePointerUp}
+                    onPointerCancel={drag.resetDragState}
                     onSelect={selection.handleLayerSelection}
-                    selectOnlyLayer={selection.selectOnlyLayer}
                     editing={rename.editingLayerId === layer.id}
                     editingName={rename.editingName}
                     setEditingName={rename.setEditingName}
@@ -598,7 +624,10 @@ export function LayerPanel({
         setRefreshInterval={refresh.setRefreshInterval}
         setRefreshFailurePolicy={refresh.setRefreshFailurePolicy}
       />
-      <LayerMetadataDialog metadata={metadata} />
+      <LayerMetadataDialog
+        metadata={metadata}
+        getMap={() => mapControllerRef.current?.getMap() ?? undefined}
+      />
       <RemoveLayerDialog layer={layerPendingRemoval} onClose={() => setLayerPendingRemoval(null)} />
       <PasteStyleDialog
         open={pasteStyleLayerId !== null}

@@ -39,7 +39,7 @@ interface ProjectFileDialogsProps {
   projectFiles: ProjectFileActions;
 }
 
-/** The project-file dialogs: Open-from-URL, the error dialog, the save-name prompt, and the env-var strip prompt. */
+/** The project-file dialogs: the save-before-close prompt, Open-from-URL, the error dialog, the save-name prompt, and the env-var strip prompt. */
 export function ProjectFileDialogs({ projectFiles }: ProjectFileDialogsProps) {
   const { t } = useTranslation();
 
@@ -100,6 +100,41 @@ export function ProjectFileDialogs({ projectFiles }: ProjectFileDialogsProps) {
             <Button
               disabled={projectFiles.droppedProjectSaving}
               onClick={() => void projectFiles.resolveDroppedProjectPrompt("save")}
+            >
+              {t("common.save")}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={projectFiles.windowClosePromptOpen}
+        onOpenChange={(open: boolean) => {
+          if (!open) void projectFiles.resolveWindowClosePrompt("cancel");
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t("toolbar.windowClose.savePromptTitle")}</DialogTitle>
+            <DialogDescription>{t("toolbar.windowClose.savePromptDescription")}</DialogDescription>
+          </DialogHeader>
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="outline"
+              disabled={projectFiles.windowCloseSaving}
+              onClick={() => void projectFiles.resolveWindowClosePrompt("cancel")}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={projectFiles.windowCloseSaving}
+              onClick={() => void projectFiles.resolveWindowClosePrompt("discard")}
+            >
+              {t("newProject.doNotSave")}
+            </Button>
+            <Button
+              disabled={projectFiles.windowCloseSaving}
+              onClick={() => void projectFiles.resolveWindowClosePrompt("save")}
             >
               {t("common.save")}
             </Button>
@@ -220,6 +255,50 @@ export function ProjectFileDialogs({ projectFiles }: ProjectFileDialogsProps) {
           />
           <div className="flex justify-end">
             <Button onClick={() => projectFiles.setQgisImportWarnings(null)}>
+              {t("common.ok")}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={projectFiles.layerStyleImportResult !== null}
+        onOpenChange={(open: boolean) => {
+          if (!open) projectFiles.setLayerStyleImportResult(null);
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t("toolbar.item.layerStylesImported")}</DialogTitle>
+            <DialogDescription>
+              {t("toolbar.item.layerStylesImportedSummary", {
+                count: projectFiles.layerStyleImportResult?.restyled.length ?? 0,
+                file: projectFiles.layerStyleImportResult?.fileName ?? "",
+              })}
+            </DialogDescription>
+          </DialogHeader>
+          {(projectFiles.layerStyleImportResult?.restyled.length ?? 0) > 0 && (
+            <ul className="max-h-40 list-disc space-y-1 overflow-y-auto ps-5 text-sm">
+              {projectFiles.layerStyleImportResult?.restyled.map((name, index) => (
+                <li key={`${index}-${name}`}>{name}</li>
+              ))}
+            </ul>
+          )}
+          {(projectFiles.layerStyleImportResult?.unused.length ?? 0) > 0 && (
+            <div className="space-y-1">
+              <p className="text-sm text-muted-foreground">
+                {t("toolbar.item.layerStylesUnused", {
+                  count: projectFiles.layerStyleImportResult?.unused.length ?? 0,
+                })}
+              </p>
+              <ul className="max-h-32 list-disc space-y-1 overflow-y-auto ps-5 text-sm text-muted-foreground">
+                {projectFiles.layerStyleImportResult?.unused.map((name) => (
+                  <li key={name}>{name}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <div className="flex justify-end">
+            <Button onClick={() => projectFiles.setLayerStyleImportResult(null)}>
               {t("common.ok")}
             </Button>
           </div>

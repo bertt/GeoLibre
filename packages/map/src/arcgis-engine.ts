@@ -1,5 +1,5 @@
 import { disposeArcgisControlAdapters, identifyArcgisControls } from "./arcgis-control-adapters";
-import { ArcgisControlHost } from "./arcgis-control-host";
+import { ArcgisControlHost, type ArcgisControlHostHooks } from "./arcgis-control-host";
 import { createArcgisZarrLayer } from "./arcgis-zarr";
 import { createArcgisArchiveLayer } from "./arcgis-tile-archives";
 import { createArcgisTemplateTileLayer } from "./arcgis-template-tiles";
@@ -43,6 +43,7 @@ import {
   ARCGIS_ID_FIELD,
   ARCGIS_LABEL_CLASS_FIELD,
   ARCGIS_LABEL_FIELD,
+  ARCGIS_SUPPORTED_LAYER_KINDS,
   arcgisBlendMode,
   isArcgisRasterPlan,
   ARCGIS_SYMBOL_FIELD,
@@ -109,6 +110,17 @@ export const ARCGIS_CAPABILITIES: MapEngineCapabilities = Object.freeze({
   screenOverlays: false,
   flatProjection: true,
   terrainSource: true,
+  // The SDK draws Zarr from the record. The raster and PMTiles panels are
+  // MapLibre controls this view does not host, so those formats go through the
+  // Add Data forms; the measure control draws through the MapLibre/Mapbox style
+  // API, which the SDK has no equivalent of.
+  nativeZarr: true,
+  nativeDataSources: false,
+  // The engine is published once its view is ready.
+  deferredEngineReady: true,
+  measureTool: false,
+  controlLayerPanels: false,
+  supportedLayerKinds: ARCGIS_SUPPORTED_LAYER_KINDS,
 });
 
 export const ARCGIS_DECK_CAPABILITIES: MapEngineCapabilities = Object.freeze({
@@ -544,6 +556,8 @@ export class ArcgisEngine implements MapEngine {
   /** Whether {@link settleView} has placed the stored camera. */
   private placed = false;
   private errors = new Map<string, string>();
+  /** Store ids last seen as plugin layers, whose `layer:` error means "unsupported". */
+  private pluginLayerIds = new Set<string>();
   private preferences: MapPreferences | null = null;
   private basemapPlan: ArcgisBasemapPlan | null = null;
   private basemapVisible = true;
@@ -1350,18 +1364,22 @@ export class ArcgisEngine implements MapEngine {
     for (const id of [...this.natives.keys()]) if (!ids.has(id)) this.removeLayer(id);
     for (const key of [...this.errors.keys()])
       if (key.startsWith("layer:") && !ids.has(key.slice(6))) this.errors.delete(key);
-    // Store order is topmost first; the SDK draws index 0 at the bottom.
+    // Store order is bottom to top (the last layer is the topmost, as the
+    // Layers panel lists it and MapLibre's sync stacks it), which is also the
+    // SDK's: it draws index 0 at the bottom.
     const ordered: ArcgisLayer[] = [];
-    for (const original of [...layers].reverse()) {
+    for (const original of layers) {
       const opacity = this.storyOpacities.get(original.id);
       const layer = opacity === undefined ? original : { ...original, opacity };
       if (isArcgisPluginLayer(original)) {
+        this.pluginLayerIds.add(original.id);
         this.removeLayer(original.id);
         // The layer panels badge it too; the banner says why it is missing.
         if (original.visible)
           this.errors.set(`layer:${original.id}`, this.messages.pluginLayer(original.name));
         continue;
       }
+      this.pluginLayerIds.delete(original.id);
       try {
         let entry = this.natives.get(layer.id);
         const compileKey = layer.geojson ? geojsonCompileKey(layer) : undefined;
@@ -1456,6 +1474,9 @@ export class ArcgisEngine implements MapEngine {
     });
     if (this.highlight && map.layers.indexOf(this.highlight) !== map.layers.length - 1)
       map.layers.reorder(this.highlight, map.layers.length - 1);
+    // A record registered or dropped changes which control layers the store
+    // mirrors, and so what the controls' own overlay has to draw.
+    this.controlHost?.refreshOverlay();
   }
   /** Build the SDK layers for a plan, recording blob URLs to revoke on removal. */
   private instantiate(
@@ -2042,6 +2063,47 @@ export class ArcgisEngine implements MapEngine {
     return features;
   }
   /**
+   * Hits on the store layers that mirror a plugin control's native layer, by
+   * the ids the control registered (`nativeLayerIds`) or the source it reads.
+   * The control's own layer is only recorded on this renderer (its facade's
+   * shadow style), so its mirror is what the user sees and clicks.
+   */
+  private pickNativeLayer(
+    lngLat: [number, number],
+    nativeLayerId: string,
+    sourceId: string | undefined,
+  ): IdentifiedFeature[] {
+    return this.mirrorsOf(nativeLayerId, sourceId).flatMap((layer) =>
+      this.identifyFeatures(lngLat, layer.id),
+    );
+  }
+  /** The store layers that mirror a control's native layer or source. */
+  private mirrorsOf(nativeLayerId: string, sourceId: string | undefined): GeoLibreLayer[] {
+    return this.layers.filter((layer) => {
+      const { nativeLayerIds, sourceIds } = layer.metadata as {
+        nativeLayerIds?: unknown;
+        sourceIds?: unknown;
+      };
+      return (
+        layer.id === nativeLayerId ||
+        (Array.isArray(nativeLayerIds) && nativeLayerIds.includes(nativeLayerId)) ||
+        (sourceId !== undefined &&
+          (layer.metadata.sourceId === sourceId ||
+            (Array.isArray(sourceIds) && sourceIds.includes(sourceId))))
+      );
+    });
+  }
+  /** What the control host borrows from the engine to pick and draw. */
+  private controlHostHooks(): ArcgisControlHostHooks {
+    return {
+      pick: (lngLat, nativeLayerId, sourceId) =>
+        this.pickNativeLayer(lngLat, nativeLayerId, sourceId),
+      isMirrored: (nativeLayerId, sourceId) => this.mirrorsOf(nativeLayerId, sourceId).length > 0,
+      tolerance: (lngLat) => this.degreesPerPixel(lngLat[1]) * HIT_TOLERANCE_PX,
+      toGeometry: geojsonToArcgisGeometry,
+    };
+  }
+  /**
    * Features under `lngLat`, answered synchronously. The SDK's own hit test is
    * asynchronous, so the click flow goes through {@link identifyFeaturesAt} and
    * its result is served here for the same location; any other location (the
@@ -2061,8 +2123,8 @@ export class ArcgisEngine implements MapEngine {
     const tolerance = this.degreesPerPixel(lngLat[1]) * HIT_TOLERANCE_PX;
     const zoom = this.compiledZoom;
     const features: IdentifiedFeature[] = [];
-    // Store order is topmost first, which is the order a click should report.
-    for (const layer of this.layers) {
+    // A click reports the topmost layer first; store order is bottom to top.
+    for (const layer of [...this.layers].reverse()) {
       if (layerId && layer.id !== layerId) continue;
       if (!layer.visible || !layer.geojson || !this.natives.has(layer.id)) continue;
       // The pick runs per pointer frame for hover tips, so only the features
@@ -2516,6 +2578,23 @@ export class ArcgisEngine implements MapEngine {
         }
     return { pending, errors: [...this.errors.values()] };
   }
+  /**
+   * The store layers that failed to load, as the last {@link getRenderStatus}
+   * call left them. A plugin layer the SDK cannot draw is left out: it is
+   * unsupported here, not broken, and the banner already says so.
+   *
+   * @returns Each failing layer's store id mapped to its render-status message.
+   */
+  getLayerLoadErrors(): Map<string, string> {
+    const failures = new Map<string, string>();
+    for (const [key, message] of this.errors) {
+      if (!key.startsWith("layer:")) continue;
+      const id = key.slice(6);
+      if (this.pluginLayerIds.has(id)) continue;
+      failures.set(id, message);
+    }
+    return failures;
+  }
   async captureImage(): Promise<Blob> {
     const view = this.view;
     if (!view) throw new Error("ArcGIS map is not available");
@@ -2652,11 +2731,21 @@ export class ArcgisEngine implements MapEngine {
 
   addControl(control: maplibregl.IControl, position?: maplibregl.ControlPosition): boolean {
     if (!control || !this.view || this.options.domControls === false) return false;
-    this.controlHost ??= new ArcgisControlHost(this, this.view, this.sdk);
+    this.controlHost ??= new ArcgisControlHost(this, this.view, this.sdk, this.controlHostHooks());
     return this.controlHost.addControl(control, position);
   }
   removeControl(control: maplibregl.IControl): void {
     this.controlHost?.removeControl(control);
+  }
+  /**
+   * The MapLibre-shaped map controls on this view receive: camera, events and
+   * DOM through the view, and a style that is recorded but never drawn. Null
+   * before the view exists or when DOM controls are disabled.
+   */
+  getControlMap(): maplibregl.Map | null {
+    if (!this.view || this.options.domControls === false) return null;
+    this.controlHost ??= new ArcgisControlHost(this, this.view, this.sdk, this.controlHostHooks());
+    return this.controlHost.getControlMap();
   }
   private createBuiltInControl(id: BuiltInMapControl): ArcgisWidget | null {
     const view = this.view;

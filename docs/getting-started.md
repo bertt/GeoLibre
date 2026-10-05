@@ -97,6 +97,7 @@ See [iOS](ios.md) for what runs on mobile and for build details.
 - [Mapping the 2026 Nepal Floods with Free High-Resolution Satellite Imagery](https://youtu.be/UDO1BCwOAAc)
 - [Building Cloud-Native GIS Workflows with GeoLibre](https://youtu.be/RgNoKsvZ5Hk)
 - [Image Georeferencing Using GeoLibre in the Browser](https://youtu.be/lbioujkDSG0)
+- [100 Interactive Maps from Open Data: Explore, Fork, and Build Your Own with GeoLibre](https://youtu.be/2r5OhvEa3AA)
 
 All of them, with chapters and summaries, are on [Video Tutorials](tutorials/videos.md).
 
@@ -170,10 +171,13 @@ docker run --rm -p 8080:80 ghcr.io/opengeos/geolibre:latest
 
 #### Bundled conversion sidecar
 
-The image also bundles the Python sidecar (uvicorn) and reverse-proxies it at
-`/sidecar`, so the browser reaches it same-origin with no CORS or separate
-process to manage. `/conversion/status` is reachable at
-`http://localhost:8080/sidecar/conversion/status`.
+The image bundles the Python sidecar (uvicorn) and reverse-proxies it at
+`/sidecar` when the final deployment policy grants `processing:run` or
+`data:add` and `GEOLIBRE_DISABLE_SIDECAR` is not `1`. Otherwise uvicorn does
+not start and sidecar routes are denied. When available, the browser reaches it
+same-origin with no CORS:
+`http://localhost:8080/sidecar/conversion/status`. See the exact route grants
+in [Self-Hosting](self-hosting.md#container-policy-enforcement).
 
 The browser build does **not** need the sidecar for the **Conversion** tools or
 the **Whitebox** toolbox — both run client-side on DuckDB-WASM and
@@ -199,6 +203,26 @@ a caller reaching the image cannot aim them at hosts only the container can
 reach. Pass `-e GEOLIBRE_POSTGIS_HOSTS='db.internal:5432'` (or `*` to accept any
 connection string) to enable them. The desktop app is not affected: its sidecar
 is loopback-bound and started for a single user, so it defaults to unrestricted.
+
+The image does **not** ship with pyodbc or Microsoft ODBC Driver 18. To enable
+SQL Server / Azure SQL, build a derived image that installs the driver and the
+sidecar's `mssql` extra:
+
+```dockerfile
+FROM ghcr.io/opengeos/geolibre:latest
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends curl gpg \
+ && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
+ && echo "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" > /etc/apt/sources.list.d/microsoft-prod.list \
+ && apt-get update \
+ && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 unixodbc \
+ && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir "/opt/geolibre_server[mssql]"
+```
+
+Then allow only the database host at runtime, for example
+`-e GEOLIBRE_MSSQL_HOSTS='sql.internal:1433'`. Do not expose the SQL Server
+endpoints without an explicit allowlist.
 
 `freestiler` and `whitebox-workflows` publish no linux/arm64 wheels, so they are
 installed on **amd64 only**; on arm64 the sidecar reports those tools
@@ -439,21 +463,40 @@ Individual links can also opt out at runtime with `?welcome=0`. See
 
 #### Limiting what the deployment can do
 
-For a kiosk, an exhibit terminal, or a classroom instance, name the
-capabilities the interface may offer. Unset (the default) grants everything, so
-existing deployments are unchanged:
+For a kiosk, exhibit terminal, or classroom, configure the runtime policy
+capabilities rather than rebuilding the client:
 
 ```bash
-docker build \
-  --build-arg VITE_GEOLIBRE_CAPABILITIES="project:edit,data:add,processing:run,export:data" \
-  -t geolibre-classroom .
+docker run --rm -p 8080:80 \
+  -e GEOLIBRE_CAPABILITIES=project:edit,data:add,processing:run,export:data \
+  geolibre-policy:local
 ```
 
-That example drops plugin installs and Settings. `none` grants nothing at all.
-This removes the affordances — menus, command palette entries, shortcuts,
-drag-and-drop, embed commands — but does **not** restrict the server, so keep
-the protections above in place too. See
+Build the local image from merged `main` as described in
+[Deployment Policy](deployment-policy.md#docker). The legacy
+`VITE_GEOLIBRE_CAPABILITIES` build input is still honoured as a client fallback.
+`none` grants no capabilities. Client gates remove menus, command palette
+entries, shortcuts, drag-and-drop, and embed commands; Docker nginx enforces
+selected sidecar and AI routes only. It does not restrict desktop processing,
+browser WASM, separately exposed services, or plugin execution. Keep the
+server-side protections above in place. See
 [Deployment Capabilities](deployment-capabilities.md).
+
+#### Custom app name
+
+Replace "GeoLibre" at the start of the toolbar and in the browser tab title with
+your own name:
+
+```bash
+docker run --rm -p 8080:80 \
+  -e GEOLIBRE_APP_NAME="Acme Maps" \
+  ghcr.io/opengeos/geolibre:latest
+```
+
+The name is read at container startup, so a prebuilt image can be rebranded
+without a rebuild. Runs of whitespace collapse to one space and the name is
+capped at 60 characters. For a non-Docker web build, set
+`VITE_GEOLIBRE_APP_NAME` when running `npm run build` instead.
 
 #### Driving an embedded map from a host page
 
@@ -808,6 +851,8 @@ VITE_MAPILLARY_ACCESS_TOKEN=your_mapillary_access_token
 
 For Google Street View, enable the Maps Embed API for the key in Google Cloud. For Google Photorealistic 3D Tiles, enable the Map Tiles API. For local shell testing, `GOOGLE_MAPS_API_KEY` is also accepted by the desktop Vite build. For Mapillary, create an app in the Mapillary developer dashboard and use its client access token.
 
+You can also enter either key in the Street View panel's API key inputs and apply it (this affects Street View only; Google 3D Tiles still use their own per-layer key or the environment variable). A key applied there is saved (in the OS credential store on desktop, in browser storage on the web), survives closing the panel and restarting the app, and takes precedence over the matching environment variable. Clear the field and apply to remove it.
+
 Restart `npm run dev` or `npm run tauri:dev` after changing environment variables.
 
 ## Optional basemap credentials
@@ -857,6 +902,8 @@ VITE_STADIA_API_KEY=your_stadia_api_key         # https://client.stadiamaps.com
 ```
 
 Protomaps reuses the key described in [Optional basemap credentials](#optional-basemap-credentials) above — set it once and both places pick it up. Until each key is set, the panel shows a "Get a … API key" prompt in place of the basemap rather than loading tiles.
+
+Any of these keys can instead be typed into the panel's **API keys** view (the key button in its header). A key entered there is saved (in the OS credential store on desktop, in browser storage on the web), survives closing the panel and restarting the app, and takes precedence over the matching environment variable. Clear the field to remove the saved key; a key set in the matching environment variable applies again the next time the panel opens.
 
 ## Basemaps in mainland China
 

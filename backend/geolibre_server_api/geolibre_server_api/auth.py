@@ -10,7 +10,9 @@ This module owns:
   ``/api/account``, ``/api/users/me``),
 - the OAuth 2.0 Authorization Code + PKCE (S256-only) flow: the server-owned
   login/consent form, token exchange with rotating refresh tokens and reuse
-  detection, revocation, and RFC 8414 discovery.
+  detection, revocation, and RFC 8414 discovery,
+- the consent form's organization single sign-on (the OIDC relying-party work
+  lives in ``oidc``) and trusted-proxy sign-in branches.
 
 The flow is deliberately small and pinned to the reference server rather than
 delegated to an OAuth framework: public clients only, no client secrets, no
@@ -56,6 +58,24 @@ from geolibre_server_api.auth_models import (
     PersonalTokenPolicy,
     Token,
 )
+from geolibre_server_api.enterprise_models import (
+    AccountSecurity,
+    OidcLoginState,
+    OrganizationIdentityProvider,
+    OrganizationSecurityPolicy,
+)
+from geolibre_server_api.org_models import Organization
+from geolibre_server_api.policy import (
+    credential_expired,
+    effective_policy,
+    ensure_account_security,
+    is_deactivated,
+    password_login_allowed,
+    password_policy_error,
+    record_failed_login,
+    record_successful_login,
+)
+from geolibre_server_api.proxy_identity import proxy_identity
 
 # ---------------------------------------------------------------------------
 # Scope vocabulary and grant lifetimes
@@ -373,6 +393,7 @@ class AuthPrincipal:
     scopes: frozenset[str]
     credential_id: str
     session_id: str | None
+    authenticated_at: int
 
 
 class InsufficientScopeError(HTTPException):
@@ -436,8 +457,17 @@ def touch_policy(session: Session, token_digest: str, now_ts: int) -> None:
         session.commit()
 
 
-def backfill_policy(session: Session, digest: str) -> PersonalTokenPolicy:
-    """Create legacy PAT metadata without racing another request doing the same."""
+def backfill_policy(session: Session, digest: str, *, commit: bool = True) -> PersonalTokenPolicy:
+    """Create legacy PAT metadata without racing another request doing the same.
+
+    Args:
+        session: The request session.
+        digest: Digest of the legacy personal token.
+        commit: Commit afterwards; pass False when the caller owns the transaction.
+
+    Returns:
+        The new or already-existing policy row.
+    """
     policy = PersonalTokenPolicy(
         id=str(uuid.uuid4()),
         token_digest=digest,
@@ -458,8 +488,79 @@ def backfill_policy(session: Session, digest: str) -> PersonalTokenPolicy:
         if existing is None:
             raise
         return existing
-    session.commit()
+    if commit:
+        session.commit()
     return policy
+
+
+class PasswordLoginError(Exception):
+    """A rejected password sign-in; ``code`` is one of the documented reasons."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+# Password-login rejection codes mapped to the token API's status and error.
+LOGIN_ERRORS: dict[str, tuple[int, str]] = {
+    "invalid": (401, "invalid username or password"),
+    "locked": (401, "account temporarily locked"),
+    "expired": (403, "password expired"),
+    "sso_required": (403, "single sign-on required"),
+}
+# The same codes as shown on the OAuth consent page.
+CONSENT_LOGIN_ERRORS: dict[str, str] = {
+    "invalid": "Invalid username or password",
+    "locked": "Too many failed sign-in attempts. Try again later.",
+    "expired": "Your password has expired. Change it, then sign in again.",
+    "sso_required": (
+        "Your organization requires single sign-on. Use “Sign in with your organization”."
+    ),
+}
+# Single sign-on and proxy sign-in of a SCIM-deactivated account. Password
+# sign-in reports "invalid" instead, so it reveals nothing to a password guesser.
+DEACTIVATED_MESSAGE = "This account has been deactivated."
+
+
+def verify_password_login(
+    session: Session,
+    username: str,
+    password: str,
+    now_ts: int,
+    *,
+    allow_expired: bool = False,
+) -> Account:
+    """Verify built-in credentials under the account's effective security policy."""
+    account = session.scalar(select(Account).where(Account.username == username))
+    if account is None:
+        # Hash anyway before failing. Short-circuiting here would skip the
+        # scrypt call that a real username always pays for, and the timing
+        # difference enumerates accounts one request at a time, which a
+        # request-count rate limiter does not address.
+        password_hash(password or "unused")
+        raise PasswordLoginError("invalid")
+    security = session.get(AccountSecurity, account.id)
+    locked_until = security.locked_until if security is not None else None
+    if locked_until is not None and locked_until > now_ts:
+        raise PasswordLoginError("locked")
+    policy = effective_policy(session, account.id)
+    if not password_matches(password, account.password_hash):
+        record_failed_login(session, account.id, now_ts, policy)
+        raise PasswordLoginError("invalid")
+    if is_deactivated(session, account.id):
+        raise PasswordLoginError("invalid")
+    if not password_login_allowed(session, account.id):
+        raise PasswordLoginError("sso_required")
+    if (
+        policy.password_max_age_days
+        and security is not None
+        and security.password_changed_at is not None
+        and security.password_changed_at + policy.password_max_age_days * 86400 <= now_ts
+        and not allow_expired
+    ):
+        raise PasswordLoginError("expired")
+    record_successful_login(session, account.id, now_ts)
+    return account
 
 
 def optional_principal(
@@ -494,7 +595,23 @@ def optional_principal(
                 401, "invalid or expired token", headers=bearer_challenge("invalid_token")
             )
         account = session.get(Account, oauth_session.account_id)
-        if account is None:
+        if account is None or is_deactivated(session, account.id):
+            raise HTTPException(
+                401, "invalid or expired token", headers=bearer_challenge("invalid_token")
+            )
+        authenticated_at = oauth_session.authenticated_at or oauth_session.created_at
+        if credential_expired(
+            effective_policy(session, account.id),
+            authenticated_at=authenticated_at,
+            last_activity_at=oauth_session.last_used_at or oauth_session.created_at,
+            now_ts=now_ts,
+        ):
+            session.execute(
+                update(OAuthSession)
+                .where(OAuthSession.id == oauth_session.id)
+                .values(revoked_at=now_ts)
+            )
+            session.commit()
             raise HTTPException(
                 401, "invalid or expired token", headers=bearer_challenge("invalid_token")
             )
@@ -504,6 +621,7 @@ def optional_principal(
             scopes=frozenset(oauth_session.scope.split()),
             credential_id=oauth_session.id,
             session_id=oauth_session.id,
+            authenticated_at=authenticated_at,
         )
     token_row = session.get(Token, digest)
     if token_row is None:
@@ -525,7 +643,25 @@ def optional_principal(
             401, "invalid or expired token", headers=bearer_challenge("invalid_token")
         )
     account = session.get(Account, token_row.account_id)
-    if account is None:
+    if account is None or is_deactivated(session, account.id):
+        raise HTTPException(
+            401, "invalid or expired token", headers=bearer_challenge("invalid_token")
+        )
+    token_created = int(
+        datetime.fromisoformat(token_row.created_at.replace("Z", "+00:00")).timestamp()
+    )
+    if credential_expired(
+        effective_policy(session, account.id),
+        authenticated_at=token_created,
+        last_activity_at=policy.last_used_at or token_created,
+        now_ts=now_ts,
+    ):
+        session.execute(
+            update(PersonalTokenPolicy)
+            .where(PersonalTokenPolicy.id == policy.id)
+            .values(revoked_at=now_ts)
+        )
+        session.commit()
         raise HTTPException(
             401, "invalid or expired token", headers=bearer_challenge("invalid_token")
         )
@@ -536,6 +672,7 @@ def optional_principal(
         scopes=frozenset(policy.scope.split()),
         credential_id=digest,
         session_id=None,
+        authenticated_at=token_created,
     )
 
 
@@ -568,6 +705,19 @@ def cleanup_expired_security_rows(session: Session, now_ts: int, *, batch_size: 
     if expired_access_digests:
         session.execute(
             delete(OAuthAccessToken).where(OAuthAccessToken.digest.in_(expired_access_digests))
+        )
+        changed = True
+
+    # Expired single sign-on redirects; deleting an interaction below also
+    # cascades any of its login states that are still unexpired.
+    expired_login_state_ids = list(
+        session.scalars(
+            select(OidcLoginState.id).where(OidcLoginState.expires_at <= now_ts).limit(batch_size)
+        )
+    )
+    if expired_login_state_ids:
+        session.execute(
+            delete(OidcLoginState).where(OidcLoginState.id.in_(expired_login_state_ids))
         )
         changed = True
 
@@ -770,6 +920,7 @@ def authorization_html_response(
     status: int = 200,
     *,
     form_redirect_uri: str | None = None,
+    sso_form_action: bool = False,
 ) -> HTMLResponse:
     response = HTMLResponse(body, status_code=status)
     response.headers["Cache-Control"] = "no-store"
@@ -786,6 +937,10 @@ def authorization_html_response(
             f"{redirect.scheme}://{redirect.netloc}" if redirect.netloc else f"{redirect.scheme}:"
         )
         form_action += f" {callback_source}"
+    if sso_form_action:
+        # The single sign-on POST is answered with a 303 to the organization's
+        # identity provider, whose endpoints are https-only.
+        form_action += " https:"
     response.headers["Content-Security-Policy"] = (
         f"default-src 'none'; form-action {form_action}; frame-ancestors 'none'; base-uri 'none'"
     )
@@ -812,11 +967,41 @@ def render_consent_form(
     label: str,
     scope: str,
     error: str | None,
+    *,
+    sso_available: bool = False,
+    proxy_user: str | None = None,
 ) -> str:
     scope_items = "".join(
         f"<li>{html.escape(scope_description(s))}</li>" for s in canonical_scope(scope).split()
     )
     error_html = f"<p role='alert'>{html.escape(error)}</p>" if error else ""
+    if proxy_user is not None:
+        credentials_html = (
+            "<p>Signed in through your organization's proxy as "
+            f"<strong>{html.escape(proxy_user)}</strong>.</p>"
+        )
+        allow_text = "Allow"
+    else:
+        credentials_html = (
+            "<label>Username <input type='text' name='username' "
+            "autocomplete='username' required></label>"
+            "<label>Password <input type='password' name='password' "
+            "autocomplete='current-password' required></label>"
+        )
+        allow_text = "Sign in and allow"
+    sso_html = ""
+    if sso_available and proxy_user is None:
+        sso_html = (
+            "<form method='post'>"
+            f"<input type='hidden' name='interaction' value='{html.escape(interaction_id)}'>"
+            f"<input type='hidden' name='csrf' value='{html.escape(csrf_value)}'>"
+            f"<input type='hidden' name='label' value='{html.escape(label)}'>"
+            "<label>Organization <input type='text' name='organization' "
+            "autocomplete='organization' required></label>"
+            "<button type='submit' name='decision' value='sso'>"
+            "Sign in with your organization</button>"
+            "</form>"
+        )
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<title>Authorize GeoLibre</title></head><body>"
@@ -832,13 +1017,12 @@ def render_consent_form(
         f"<input type='hidden' name='csrf' value='{html.escape(csrf_value)}'>"
         "<label>Device label <input type='text' name='label' maxlength='100' "
         f"value='{html.escape(label)}'></label>"
-        "<label>Username <input type='text' name='username' "
-        "autocomplete='username' required></label>"
-        "<label>Password <input type='password' name='password' "
-        "autocomplete='current-password' required></label>"
-        "<button type='submit' name='decision' value='allow'>Sign in and allow</button>"
+        f"{credentials_html}"
+        f"<button type='submit' name='decision' value='allow'>{allow_text}</button>"
         "<button type='submit' name='decision' value='cancel' formnovalidate>Cancel</button>"
-        "</form></body></html>"
+        "</form>"
+        f"{sso_html}"
+        "</body></html>"
     )
 
 
@@ -988,6 +1172,16 @@ class RevokeOtherSessionsRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class PasswordChangeRequest(BaseModel):
+    """Body for ``POST /api/account/password``."""
+
+    username: str
+    current_password: str = Field(alias="currentPassword", max_length=1024)
+    new_password: str = Field(alias="newPassword", max_length=1024)
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+
 def owned_project_session(
     session: Session, account_id: str, session_id: str, now_ts: int, *, lock: bool = False
 ) -> OAuthSession:
@@ -1006,14 +1200,21 @@ def owned_project_session(
     return project
 
 
-def backfill_account_policies(session: Session, account_id: str) -> None:
+def backfill_account_policies(session: Session, account_id: str, *, commit: bool = True) -> None:
+    """Give every legacy token of the account a policy row.
+
+    Args:
+        session: The request session.
+        account_id: Account whose legacy tokens are backfilled.
+        commit: Commit per row; pass False when the caller owns the transaction.
+    """
     missing = session.scalars(
         select(Token.digest)
         .outerjoin(PersonalTokenPolicy, PersonalTokenPolicy.token_digest == Token.digest)
         .where(Token.account_id == account_id, PersonalTokenPolicy.id.is_(None))
     ).all()
     for digest in missing:
-        backfill_policy(session, digest)
+        backfill_policy(session, digest, commit=commit)
 
 
 def _validate_pat_lifetime(days: int | None) -> None:
@@ -1056,6 +1257,9 @@ def build_identity_router() -> APIRouter:
             created_at=now(),
         )
         session.add(account)
+        session.add(
+            AccountSecurity(account_id=account.id, password_changed_at=get_clock(request)())
+        )
         try:
             session.flush()
         except IntegrityError:
@@ -1084,16 +1288,13 @@ def build_identity_router() -> APIRouter:
     ):
         """Exchange account credentials for a personal API token."""
         _validate_pat_lifetime(body.expiresInDays)
-        account = session.scalar(select(Account).where(Account.username == body.username))
-        if account is None:
-            # Hash anyway before failing. Short-circuiting here would skip the
-            # scrypt call that a real username always pays for, and the timing
-            # difference enumerates accounts one request at a time, which a
-            # request-count rate limiter does not address.
-            password_hash(body.password or "unused")
-            raise HTTPException(401, "invalid username or password")
-        if not password_matches(body.password, account.password_hash):
-            raise HTTPException(401, "invalid username or password")
+        try:
+            account = verify_password_login(
+                session, body.username, body.password, get_clock(request)()
+            )
+        except PasswordLoginError as exc:
+            status, message = LOGIN_ERRORS[exc.code]
+            raise HTTPException(status, message) from None
         token, extra = issue_token(
             session,
             account,
@@ -1103,6 +1304,31 @@ def build_identity_router() -> APIRouter:
             clock=get_clock(request),
         )
         return {"account": account_json(account), "token": token, **extra}
+
+    @router.post("/api/account/password", status_code=204)
+    def change_password(
+        body: PasswordChangeRequest,
+        request: Request,
+        session: Session = Depends(get_session),
+    ):
+        """Change a password with the current one; works after the password expired."""
+        now_ts = get_clock(request)()
+        try:
+            account = verify_password_login(
+                session, body.username, body.current_password, now_ts, allow_expired=True
+            )
+        except PasswordLoginError as exc:
+            status, message = LOGIN_ERRORS[exc.code]
+            raise HTTPException(status, message) from None
+        if body.new_password == body.current_password:
+            raise HTTPException(422, "new password must differ from the current password")
+        error = password_policy_error(body.new_password, effective_policy(session, account.id))
+        if error:
+            raise HTTPException(422, error)
+        account.password_hash = password_hash(body.new_password)
+        ensure_account_security(session, account.id).password_changed_at = now_ts
+        session.commit()
+        return Response(status_code=204)
 
     @router.delete("/api/auth/token", status_code=204)
     def revoke(
@@ -1370,11 +1596,27 @@ def build_identity_router() -> APIRouter:
 def build_oauth_router(config: OAuthConfig) -> APIRouter:
     """Build the Authorization Code + S256 PKCE surface for an enabled server."""
 
+    # The OIDC relying party layers above this module; import it here, not at
+    # module load, so ``oidc`` can depend on ``auth``.
+    from geolibre_server_api import oidc
+
     router = APIRouter(dependencies=[Depends(require_issuer_host(config))])
     # __Host- cookies require Secure; Safari rejects Secure cookies on HTTP
     # loopback, which is permitted only for local development by parse_issuer.
     secure_cookie = config.issuer.startswith("https://")
     browser_cookie = BROWSER_COOKIE if secure_cookie else "geolibre_oauth_browser"
+    sso_redirect_uri = f"{config.issuer}/oauth/sso/callback"
+
+    def _sso_available(session: Session, proxy_user: str | None) -> bool:
+        """Offer organization sign-in when any provider is enabled (never in proxy mode)."""
+        if proxy_user is not None:
+            return False
+        enabled = session.scalar(
+            select(func.count())
+            .select_from(OrganizationIdentityProvider)
+            .where(OrganizationIdentityProvider.enabled.is_(True))
+        )
+        return (enabled or 0) > 0
 
     # -- GET /oauth/authorize: start a pending interaction and render consent --
 
@@ -1425,6 +1667,11 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
         label = params.get("device_label", "") or client.name
         if len(label) > 100:
             return oauth_error_redirect(config.issuer, redirect_uri, "invalid_request", state)
+        try:
+            identity = proxy_identity(request)
+        except ValueError:
+            return oauth_error_page(400, "invalid_request", "invalid proxy identity")
+        proxy_user = identity.user if identity is not None else None
 
         now_ts = get_clock(request)()
         cleanup_expired_security_rows(session, now_ts)
@@ -1477,6 +1724,7 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
         session.add(interaction)
         session.commit()
 
+        sso_available = _sso_available(session, proxy_user)
         response = authorization_html_response(
             render_consent_form(
                 config,
@@ -1487,8 +1735,11 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
                 label,
                 scope,
                 None,
+                sso_available=sso_available,
+                proxy_user=proxy_user,
             ),
             form_redirect_uri=redirect_uri,
+            sso_form_action=sso_available,
         )
         response.set_cookie(
             browser_cookie,
@@ -1539,7 +1790,7 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
         label = fields.get("label", "").strip()
         username = fields.get("username", "").strip()
         password = fields.get("password", "")
-        if not interaction_id or not csrf or decision not in ("allow", "cancel"):
+        if not interaction_id or not csrf or decision not in ("allow", "cancel", "sso"):
             return oauth_error_page(400, "invalid_request", "invalid form")
         if not (1 <= len(label) <= 100) or any(ord(c) < 32 for c in label):
             return oauth_error_page(400, "invalid_request", "invalid label")
@@ -1592,39 +1843,167 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
                 config.issuer, interaction.redirect_uri, "access_denied", interaction.state
             )
 
-        # Credential verification: the same scrypt work as /api/auth/token, but
-        # no PAT is minted and the login never hits the token API.
-        account = session.scalar(select(Account).where(Account.username == username))
-        if account is None:
-            password_hash(password or "unused")
-            return authorization_html_response(
-                render_consent_form(
-                    config,
-                    client,
-                    interaction.redirect_uri,
-                    interaction.id,
-                    csrf,
-                    label,
-                    interaction.scope,
-                    "Invalid username or password",
-                ),
-                form_redirect_uri=interaction.redirect_uri,
-            )
-        if not password_matches(password, account.password_hash):
-            return authorization_html_response(
-                render_consent_form(
-                    config,
-                    client,
-                    interaction.redirect_uri,
-                    interaction.id,
-                    csrf,
-                    label,
-                    interaction.scope,
-                    "Invalid username or password",
-                ),
-                form_redirect_uri=interaction.redirect_uri,
+        try:
+            identity = proxy_identity(request)
+        except ValueError:
+            return oauth_error_page(400, "invalid_request", "invalid proxy identity")
+        proxy_user = identity.user if identity is not None else None
+
+        if decision == "sso":
+            if identity is not None:
+                # The proxy's identity is authoritative; the consent form never
+                # offers organization sign-in alongside it.
+                return oauth_error_page(
+                    400, "invalid_request", "single sign-on is unavailable behind the proxy"
+                )
+            return _start_single_sign_on(
+                session,
+                interaction,
+                client,
+                csrf,
+                label,
+                fields.get("organization", "").strip().lower(),
+                now_ts,
+                proxy_user=proxy_user,
             )
 
+        if identity is not None:
+            # The trusted proxy already authenticated this user.
+            try:
+                account = oidc.resolve_proxy_account(session, identity, now_ts)
+            except oidc.OidcError as exc:
+                session.rollback()
+                oidc.logger.warning("proxy sign-in rejected: %s", exc)
+                return oauth_error_page(400, "invalid_request", "proxy sign-in failed")
+            if is_deactivated(session, account.id):
+                return _consent_error(
+                    session,
+                    interaction,
+                    client,
+                    csrf,
+                    label,
+                    DEACTIVATED_MESSAGE,
+                    proxy_user=proxy_user,
+                )
+            return _approve_interaction(
+                session, interaction, account.id, label, now_ts, authenticated_at=now_ts
+            )
+
+        # Credential verification: the same scrypt work and lockout/rotation
+        # policy as /api/auth/token, but no PAT is minted.
+        try:
+            account = verify_password_login(session, username, password, now_ts)
+        except PasswordLoginError as exc:
+            return _consent_error(
+                session,
+                interaction,
+                client,
+                csrf,
+                label,
+                CONSENT_LOGIN_ERRORS[exc.code],
+                proxy_user=proxy_user,
+            )
+        return _approve_interaction(
+            session, interaction, account.id, label, now_ts, authenticated_at=now_ts
+        )
+
+    def _start_single_sign_on(
+        session: Session,
+        interaction: OAuthAuthorizationCode,
+        client: OAuthClient,
+        csrf: str,
+        label: str,
+        slug: str,
+        now_ts: int,
+        *,
+        proxy_user: str | None,
+    ) -> Response:
+        """Redirect the browser to the named organization's identity provider."""
+        provider = None
+        if slug:
+            provider = session.scalar(
+                select(OrganizationIdentityProvider)
+                .join(Organization, Organization.id == OrganizationIdentityProvider.organization_id)
+                .where(Organization.slug == slug, OrganizationIdentityProvider.enabled.is_(True))
+            )
+        if provider is None:
+            return _consent_error(
+                session,
+                interaction,
+                client,
+                csrf,
+                label,
+                "Single sign-on is not configured for that organization",
+                proxy_user=proxy_user,
+            )
+        org_policy = session.get(OrganizationSecurityPolicy, provider.organization_id)
+        max_age = org_policy.admin_reauth_seconds if org_policy is not None else None
+        state = secrets.token_urlsafe(32)
+        nonce = secrets.token_urlsafe(32)
+        code_verifier = secrets.token_urlsafe(64)
+        session.add(
+            OidcLoginState(
+                id=str(uuid.uuid4()),
+                state_digest=token_digest(state),
+                nonce=nonce,
+                code_verifier=code_verifier,
+                provider_id=provider.id,
+                interaction_id=interaction.id,
+                label=label,
+                max_age=max_age,
+                expires_at=now_ts + config.interaction_ttl,
+            )
+        )
+        session.commit()
+        return no_store_redirect(
+            oidc.build_authorization_redirect(
+                provider,
+                redirect_uri=sso_redirect_uri,
+                state=state,
+                nonce=nonce,
+                code_challenge=base64url_sha256(code_verifier),
+                max_age=max_age,
+            )
+        )
+
+    def _consent_error(
+        session: Session,
+        interaction: OAuthAuthorizationCode,
+        client: OAuthClient,
+        csrf: str,
+        label: str,
+        message: str,
+        *,
+        proxy_user: str | None,
+    ) -> HTMLResponse:
+        """Re-render the consent form for this interaction with an error message."""
+        sso_available = _sso_available(session, proxy_user)
+        return authorization_html_response(
+            render_consent_form(
+                config,
+                client,
+                interaction.redirect_uri,
+                interaction.id,
+                csrf,
+                label,
+                interaction.scope,
+                message,
+                sso_available=sso_available,
+                proxy_user=proxy_user,
+            ),
+            form_redirect_uri=interaction.redirect_uri,
+            sso_form_action=sso_available,
+        )
+
+    def _approve_interaction(
+        session: Session,
+        interaction: OAuthAuthorizationCode,
+        account_id: str,
+        label: str,
+        now_ts: int,
+        authenticated_at: int,
+    ) -> Response:
+        """Approve a pending interaction for an authenticated account and mint the code."""
         code_value = secrets.token_urlsafe(32)
         # Atomic consume-on-approve: a double submission cannot issue two live
         # codes (the unique code_digest column backs the same guarantee).
@@ -1637,11 +2016,12 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
                 OAuthAuthorizationCode.interaction_expires_at > now_ts,
             )
             .values(
-                account_id=account.id,
+                account_id=account_id,
                 label=label,
                 approved_at=now_ts,
                 code_digest=token_digest(code_value),
                 code_expires_at=now_ts + config.code_ttl,
+                authenticated_at=authenticated_at,
             )
         ).rowcount
         if not updated:
@@ -1664,6 +2044,137 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
     ):
         try:
             return _complete_authorization(request, session, body)
+        except OperationalError as exc:
+            session.rollback()
+            if not is_sqlite_lock_error(session, exc):
+                raise
+            return oauth_error_page(503, "temporarily_unavailable", "please try again")
+
+    # -- GET /oauth/sso/callback: the organization IdP returns to the consent --
+
+    def _sso_rejected() -> HTMLResponse:
+        # One generic page: the reason is logged, never shown to the browser.
+        return oauth_error_page(400, "invalid_request", "single sign-on response rejected")
+
+    def _finish_single_sign_on(request: Request, session: Session):
+        params = request.query_params
+        if any(len(params.getlist(key)) > 1 for key in ("state", "code", "error")):
+            return _sso_rejected()
+        state = params.get("state", "")
+        if not state:
+            return _sso_rejected()
+        now_ts = get_clock(request)()
+        login_state = session.scalar(
+            select(OidcLoginState).where(OidcLoginState.state_digest == token_digest(state))
+        )
+        if (
+            login_state is None
+            or login_state.expires_at <= now_ts
+            or login_state.consumed_at is not None
+        ):
+            return _sso_rejected()
+        interaction = session.get(OAuthAuthorizationCode, login_state.interaction_id)
+        if (
+            interaction is None
+            or interaction.interaction_expires_at <= now_ts
+            or interaction.consumed_at is not None
+            or interaction.approved_at is not None
+        ):
+            return _sso_rejected()
+        # The IdP redirect must land in the browser that started consent.
+        cookie = request.cookies.get(browser_cookie)
+        if (
+            not cookie
+            or interaction.browser_cookie_digest is None
+            or not hmac.compare_digest(token_digest(cookie), interaction.browser_cookie_digest)
+        ):
+            return _sso_rejected()
+
+        if params.get("error"):
+            session.execute(
+                update(OidcLoginState)
+                .where(OidcLoginState.id == login_state.id, OidcLoginState.consumed_at.is_(None))
+                .values(consumed_at=now_ts)
+            )
+            session.execute(
+                update(OAuthAuthorizationCode)
+                .where(
+                    OAuthAuthorizationCode.id == interaction.id,
+                    OAuthAuthorizationCode.approved_at.is_(None),
+                    OAuthAuthorizationCode.consumed_at.is_(None),
+                )
+                .values(consumed_at=now_ts)
+            )
+            session.commit()
+            return oauth_error_redirect(
+                config.issuer, interaction.redirect_uri, "access_denied", interaction.state
+            )
+
+        code = params.get("code", "")
+        if not code:
+            return _sso_rejected()
+        # Single use: of two concurrent callbacks for one state, only one
+        # redeems the provider's code.
+        claimed = session.execute(
+            update(OidcLoginState)
+            .where(OidcLoginState.id == login_state.id, OidcLoginState.consumed_at.is_(None))
+            .values(consumed_at=now_ts)
+        ).rowcount
+        if not claimed:
+            session.rollback()
+            return _sso_rejected()
+        session.commit()
+
+        provider = session.get(OrganizationIdentityProvider, login_state.provider_id)
+        if provider is None or not provider.enabled:
+            return _sso_rejected()
+        http = request.app.state.oidc_http
+        # The settings this sign-in validates against; linking re-checks them.
+        validated_with = (provider.issuer, provider.jwks_uri)
+        try:
+            id_token = oidc.exchange_authorization_code(
+                http, provider, code, login_state.code_verifier, sso_redirect_uri
+            )
+            claims = oidc.validate_id_token(
+                session,
+                http,
+                provider,
+                id_token,
+                nonce=login_state.nonce,
+                now_ts=now_ts,
+                max_age=login_state.max_age,
+            )
+            account = oidc.resolve_oidc_account(
+                session, provider, claims, now_ts, validated_with=validated_with
+            )
+        except oidc.OidcError as exc:
+            session.rollback()
+            oidc.logger.warning("oidc sign-in rejected: %s", exc)
+            return _sso_rejected()
+        if is_deactivated(session, account.id):
+            return oauth_error_page(403, "access_denied", DEACTIVATED_MESSAGE)
+        auth_time = claims.get("auth_time")
+        authenticated_at = (
+            min(auth_time, now_ts)
+            if isinstance(auth_time, int) and not isinstance(auth_time, bool)
+            else now_ts
+        )
+        return _approve_interaction(
+            session,
+            interaction,
+            account.id,
+            login_state.label,
+            now_ts,
+            authenticated_at=authenticated_at,
+        )
+
+    @router.get("/oauth/sso/callback")
+    def oauth_sso_callback(
+        request: Request,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            return _finish_single_sign_on(request, session)
         except OperationalError as exc:
             session.rollback()
             if not is_sqlite_lock_error(session, exc):
@@ -1713,12 +2224,21 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
             or code_row.account_id is None
             or code_row.code_expires_at is None
             or code_row.code_expires_at <= now_ts
+            # Deactivated between approval and exchange.
+            or is_deactivated(session, code_row.account_id)
         ):
             return oauth_token_error(400, "invalid_grant")
 
         session_id = str(uuid.uuid4())
         management = code_row.scope == MANAGEMENT_SCOPE
         family_expires = now_ts + (MANAGEMENT_TTL_SECONDS if management else config.refresh_ttl)
+        if not management:
+            policy = effective_policy(session, code_row.account_id)
+            if policy.absolute_lifetime:
+                family_expires = min(
+                    family_expires,
+                    (code_row.authenticated_at or now_ts) + policy.absolute_lifetime,
+                )
         access_expires = min(now_ts + config.access_ttl, family_expires)
         oauth_session = OAuthSession(
             id=session_id,
@@ -1730,6 +2250,7 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
             created_at=now_ts,
             expires_at=family_expires,
             rotation_version=0,
+            authenticated_at=code_row.authenticated_at,
         )
         access_value = secrets.token_urlsafe(32)
         session.add(oauth_session)
@@ -1811,6 +2332,20 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
             or refresh.expires_at <= now_ts
         ):
             return oauth_token_error(400, "invalid_grant")
+        policy = effective_policy(session, oauth_session.account_id)
+        if is_deactivated(session, oauth_session.account_id) or credential_expired(
+            policy,
+            authenticated_at=oauth_session.authenticated_at or oauth_session.created_at,
+            last_activity_at=oauth_session.last_used_at or oauth_session.created_at,
+            now_ts=now_ts,
+        ):
+            session.execute(
+                update(OAuthSession)
+                .where(OAuthSession.id == oauth_session.id)
+                .values(revoked_at=now_ts)
+            )
+            session.commit()
+            return oauth_token_error(400, "invalid_grant")
         if refresh.consumed_at is not None:
             # Reuse: a consumed generation presented with its correct binding
             # revokes the whole family (including any tokens minted by the
@@ -1841,7 +2376,7 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
                 OAuthSession.revoked_at.is_(None),
                 OAuthSession.expires_at > now_ts,
             )
-            .values(rotation_version=OAuthSession.rotation_version + 1)
+            .values(rotation_version=OAuthSession.rotation_version + 1, last_used_at=now_ts)
         ).rowcount
         if not rotated:
             session.rollback()

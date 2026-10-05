@@ -1,4 +1,5 @@
 import { normalizeCesiumBasemap } from "./cesium-imagery";
+import { redactUrlCredentials } from "./credentials";
 import { v4 as uuidv4 } from "uuid";
 import {
   DEFAULT_BASEMAP,
@@ -56,11 +57,13 @@ import {
   type CommentAuthor,
   type CommentReply,
   type ProjectComment,
+  type ProjectInteraction,
 } from "./types";
 import { DEFAULT_LAYER_GROUP_OPACITY, normalizeGroupContiguity } from "./layer-groups";
 import { normalizeStyleLibraryEntries } from "./style-library";
 import { normalizeLayerCapabilities } from "./capabilities";
 import { validateMapExpression } from "./expressions";
+import { normalizeLayerDescriptiveMetadata } from "./layer-descriptive-metadata";
 import {
   createDefaultPrintLayout,
   isDefaultPrintLayout,
@@ -314,13 +317,73 @@ export function serializeProjectWithLayerCache(
   layerSources: readonly object[],
   cache: ProjectLayerSerializationCache,
 ): string {
+  const steps = serializeProjectWithLayerCacheSteps(project, layerSources, cache);
+  for (;;) {
+    const step = steps.next();
+    if (step.done) return step.value;
+  }
+}
+
+/** Time a main-thread serialization slice may run before it yields (ms). */
+const SERIALIZE_SLICE_MS = 8;
+
+/** Resolve on a macrotask, letting input and paint run in between slices. */
+function yieldToMainThread(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/**
+ * {@link serializeProjectWithLayerCache} that hands the main thread back
+ * between layers, so autosave on a project with several large layers is many
+ * short tasks instead of one 300-400 ms freeze (GeoLibre#2869).
+ *
+ * The cache makes a camera move free, so the cost lands on the first autosave
+ * and on edits to a big layer: each layer that misses the cache is serialized
+ * in its own slice, and the thread is released once a slice has run longer than
+ * a few milliseconds. A single huge layer is still one slice. The result is
+ * identical to the synchronous call. `project` and `layerSources` must not be
+ * mutated while this runs; the store replaces records rather than editing them,
+ * so a snapshot taken from it stays valid.
+ *
+ * @param project Project to serialize, as built from `layerSources`.
+ * @param layerSources Immutable source record for each entry of
+ *   `project.layers`, in the same order, used as the cache key.
+ * @param cache Cache shared between calls.
+ * @param yieldFn Hands the thread back; replaced in tests.
+ * @returns The same text {@link serializeProject} returns for `project`.
+ */
+export async function serializeProjectWithLayerCacheAsync(
+  project: GeoLibreProject,
+  layerSources: readonly object[],
+  cache: ProjectLayerSerializationCache,
+  yieldFn: () => Promise<void> = yieldToMainThread,
+): Promise<string> {
+  const steps = serializeProjectWithLayerCacheSteps(project, layerSources, cache);
+  let sliceStart = Date.now();
+  for (;;) {
+    const step = steps.next();
+    if (step.done) return step.value;
+    if (Date.now() - sliceStart >= SERIALIZE_SLICE_MS) {
+      await yieldFn();
+      sliceStart = Date.now();
+    }
+  }
+}
+
+/** Shared body of the sync and async serializers; yields once per layer text built. */
+function* serializeProjectWithLayerCacheSteps(
+  project: GeoLibreProject,
+  layerSources: readonly object[],
+  cache: ProjectLayerSerializationCache,
+): Generator<void, string, void> {
   if (layerSources.length !== project.layers.length) return serializeProject(project);
   const layers = project.layers.map(portableLayer);
   // Presets are keyed by layer object, so a record listed twice would get one
   // index's text in both places. The store never does that; bypass if it does.
   if (new Set(layers).size !== layers.length) return serializeProject(project);
   const presets = new Map<object, string>();
-  layers.forEach((layer, index) => {
+  for (let index = 0; index < layers.length; index += 1) {
+    const layer = layers[index];
     const source = layerSources[index];
     const cached = cache.get(source);
     // The layer is serialized under its array index as the key (a `toJSON`
@@ -330,9 +393,10 @@ export function serializeProjectWithLayerCache(
       // Depth 2: the root object is depth 0 and its `layers` array depth 1.
       text = serializeProjectValue(layer, 2, String(index), new Set()) ?? "null";
       cache.set(source, { index, text });
+      yield;
     }
     presets.set(layer, text);
-  });
+  }
   return serializeProjectValue({ ...project, layers }, 0, "", new Set(), presets) ?? "null";
 }
 
@@ -370,6 +434,7 @@ export function parseProject(json: string): GeoLibreProject {
   );
   const styleLibrary = normalizeStyleLibraryEntries(data.styleLibrary);
   const parsedComments = normalizeProjectComments(data.comments);
+  const parsedInteraction = normalizeProjectInteraction(data.interaction);
   return {
     version: data.version,
     name: data.name,
@@ -411,6 +476,7 @@ export function parseProject(json: string): GeoLibreProject {
       : {}),
     ...(styleLibrary.length > 0 ? { styleLibrary } : {}),
     ...(parsedComments.length > 0 ? { comments: parsedComments } : {}),
+    ...(parsedInteraction ? { interaction: parsedInteraction } : {}),
     metadata: data.metadata ?? {},
   };
 }
@@ -1039,6 +1105,7 @@ export function normalizeSecondaryMapViews(value: unknown): SecondaryMapView[] |
     const label = normalizeString(candidate.label);
     // Only the known engine ids survive; an absent/unknown value is omitted so
     // the pane defaults to the 2D map (back-compat with pre-globe projects).
+    /* eslint-disable local/no-renderer-kind-checks -- validates a renderer name */
     const viewKind =
       candidate.viewKind === "cesium" ||
       candidate.viewKind === "maplibre" ||
@@ -1046,6 +1113,7 @@ export function normalizeSecondaryMapViews(value: unknown): SecondaryMapView[] |
       candidate.viewKind === "arcgis"
         ? candidate.viewKind
         : undefined;
+    /* eslint-enable local/no-renderer-kind-checks */
     views.push({
       id,
       view: normalizeMapViewState(candidate.view),
@@ -1263,6 +1331,41 @@ export function normalizeDashboardColumns(value: unknown): number {
   return Math.max(MIN_DASHBOARD_COLUMNS, Math.min(MAX_DASHBOARD_COLUMNS, Math.trunc(value)));
 }
 
+/**
+ * Coerce an untrusted `interaction` block into a {@link ProjectInteraction}.
+ *
+ * Layer ids are kept even when no such layer exists: the block is replayed
+ * against whatever layers the project has when it opens, and the loader drops
+ * the ones it cannot find. Control names are kept as written for the same
+ * reason; the app ignores names it does not know.
+ *
+ * @param value - Raw `interaction` value from the project JSON or the store.
+ * @returns The normalized block, or null when it carries nothing to apply.
+ */
+export function normalizeProjectInteraction(value: unknown): ProjectInteraction | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = value as { identify?: unknown; controls?: unknown };
+  const result: ProjectInteraction = {};
+  if (raw.identify === null) {
+    result.identify = null;
+  } else if (typeof raw.identify === "string" && raw.identify) {
+    result.identify = raw.identify;
+  } else if (Array.isArray(raw.identify)) {
+    const ids = [
+      ...new Set(raw.identify.filter((id): id is string => typeof id === "string" && !!id)),
+    ];
+    if (ids.length > 0) result.identify = ids;
+  }
+  if (raw.controls && typeof raw.controls === "object" && !Array.isArray(raw.controls)) {
+    const controls: Record<string, boolean> = {};
+    for (const [name, shown] of Object.entries(raw.controls)) {
+      if (name && typeof shown === "boolean") controls[name] = shown;
+    }
+    if (Object.keys(controls).length > 0) result.controls = controls;
+  }
+  return "identify" in result || result.controls ? result : null;
+}
+
 function normalizeProjectPreferences(preferences: unknown): ProjectPreferences {
   if (!preferences || typeof preferences !== "object") {
     return DEFAULT_PROJECT_PREFERENCES;
@@ -1333,6 +1436,16 @@ function normalizeProjectPreferences(preferences: unknown): ProjectPreferences {
         typeof (map as Partial<ProjectPreferences["map"]>).coordinateFormat === "string"
           ? ((map as Partial<ProjectPreferences["map"]>).coordinateFormat as string)
           : DEFAULT_PROJECT_PREFERENCES.map.coordinateFormat,
+      // Absent in projects written before the EPSG readout existed; only a
+      // positive integer survives, so a hand-edited value cannot reach proj4.
+      coordinateEpsgCode: normalizeEpsgCode(
+        (map as Partial<ProjectPreferences["map"]>).coordinateEpsgCode,
+      ),
+      // Older projects omit this field and keep fitting to newly added data.
+      zoomToNewLayers: normalizeBoolean(
+        (map as Partial<ProjectPreferences["map"]>).zoomToNewLayers,
+        DEFAULT_PROJECT_PREFERENCES.map.zoomToNewLayers,
+      ),
     },
     environmentVariables: Array.isArray(candidate.environmentVariables)
       ? candidate.environmentVariables
@@ -1341,6 +1454,19 @@ function normalizeProjectPreferences(preferences: unknown): ProjectPreferences {
       : [],
     geocoding: normalizeGeocodingPreferences(candidate.geocoding),
   };
+}
+
+/**
+ * Keep a stored EPSG code only when it is a positive integer.
+ *
+ * Args:
+ *   value: The stored value, of unknown shape.
+ *
+ * Returns:
+ *   The code, or undefined for anything else.
+ */
+function normalizeEpsgCode(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
 function normalizeGeocodingPreferences(geocoding: unknown): ProjectPreferences["geocoding"] {
@@ -1432,6 +1558,7 @@ function normalizeEnvironmentVariable(variable: unknown): RuntimeEnvironmentVari
     key,
     value: typeof candidate.value === "string" ? candidate.value : "",
     enabled: normalizeBoolean(candidate.enabled, true),
+    ...(candidate.secret === false ? { secret: false } : {}),
   };
 }
 
@@ -1578,8 +1705,16 @@ function normalizeLayer(layer: GeoLibreLayer): GeoLibreLayer {
   // that normalizes to nothing (`{}`, an array, a string, an object with no
   // boolean flag) must not survive into the normalized layer and be written
   // back out on the next save.
-  const { capabilities: rawCapabilities, filterExpression: rawFilterExpression, ...rest } = layer;
+  const {
+    capabilities: rawCapabilities,
+    filterExpression: rawFilterExpression,
+    descriptiveMetadata: rawDescriptiveMetadata,
+    ...rest
+  } = layer;
   const capabilities = normalizeLayerCapabilities(rawCapabilities);
+  // Same split for the user-authored catalog metadata: a block that cleans to
+  // nothing (every field blank) is dropped rather than round-tripped.
+  const descriptiveMetadata = normalizeLayerDescriptiveMetadata(rawDescriptiveMetadata);
   const filterExpression =
     Array.isArray(rawFilterExpression) &&
     rawFilterExpression.length > 0 &&
@@ -1595,6 +1730,7 @@ function normalizeLayer(layer: GeoLibreLayer): GeoLibreLayer {
     source: layer.source ?? {},
     ...(capabilities ? { capabilities } : {}),
     ...(filterExpression ? { filterExpression } : {}),
+    ...(descriptiveMetadata ? { descriptiveMetadata } : {}),
   };
 }
 
@@ -1718,6 +1854,8 @@ export function projectFromStore(state: {
   /** Project-scoped Style Manager entries (the store's `projectStyleLibrary`). */
   styleLibrary?: StyleLibraryEntry[] | null;
   comments?: ProjectComment[] | null;
+  /** Startup interaction state loaded with the project, written back as-is. */
+  interaction?: ProjectInteraction | null;
   metadata: Record<string, unknown>;
 }): GeoLibreProject {
   const styles: Record<string, LayerStyle> = {};
@@ -1734,6 +1872,7 @@ export function projectFromStore(state: {
   const processingHistory = normalizeProcessingHistory(state.processingHistory);
   const widgets = normalizeWidgets(state.widgets);
   const comments = normalizeProjectComments(state.comments);
+  const interaction = normalizeProjectInteraction(state.interaction);
   // Persist a non-default column count only; a default-layout dashboard (or a
   // widget-less project) stays free of the key for legacy readers.
   const dashboardColumns =
@@ -1799,6 +1938,7 @@ export function projectFromStore(state: {
       : {}),
     ...(styleLibrary.length > 0 ? { styleLibrary } : {}),
     ...(comments.length > 0 ? { comments } : {}),
+    ...(interaction ? { interaction } : {}),
     metadata: state.metadata,
   };
 }
@@ -1819,7 +1959,47 @@ function hasRestorableSourceUrl(layer: GeoLibreLayer): boolean {
 }
 
 function prepareLayerForSave(layer: GeoLibreLayer): GeoLibreLayer {
+  const hasGeometryEdits = layer.metadata.geometryEdited === true;
   layer = portableLayer(layer);
+  // WFS feature URLs can contain inline authentication supplied by a plugin.
+  // Persist a sanitized reference, and keep the fetched collection embedded so
+  // the saved project remains renderable without storing those credentials.
+  // The stripped flag is persisted alongside that sanitized reference: once the
+  // reference is stored credential-free, a later save of the reopened project
+  // cannot tell that the URL ever needed a secret, and would drop the embedded
+  // features the reference can no longer re-fetch without it.
+  let wfsCredentialsRedacted = layer.metadata.wfsCredentialsRedacted === true;
+  if (layer.metadata.sourceKind === "wfs-getfeature") {
+    const sourceUrl =
+      typeof layer.source.url === "string"
+        ? redactUrlCredentials(layer.source.url)
+        : layer.source.url;
+    const sourcePath =
+      typeof layer.sourcePath === "string"
+        ? redactUrlCredentials(layer.sourcePath)
+        : layer.sourcePath;
+    const originalUrl =
+      typeof layer.metadata.originalUrl === "string"
+        ? redactUrlCredentials(layer.metadata.originalUrl)
+        : layer.metadata.originalUrl;
+    const stripped =
+      sourceUrl !== layer.source.url ||
+      sourcePath !== layer.sourcePath ||
+      originalUrl !== layer.metadata.originalUrl;
+    wfsCredentialsRedacted ||= stripped;
+    if (stripped) {
+      layer = {
+        ...layer,
+        source: sourceUrl === layer.source.url ? layer.source : { ...layer.source, url: sourceUrl },
+        sourcePath,
+        metadata: {
+          ...layer.metadata,
+          ...(originalUrl === layer.metadata.originalUrl ? {} : { originalUrl }),
+          wfsCredentialsRedacted: true,
+        },
+      };
+    }
+  }
   // This flag describes unsaved changes to the live source, not persisted
   // project state. A reference-only save reloads the original geometries;
   // carrying the flag into that project would warn about nonexistent edits.
@@ -1839,6 +2019,14 @@ function prepareLayerForSave(layer: GeoLibreLayer): GeoLibreLayer {
   if (layer.embedFilter !== undefined) {
     const { embedFilter: _embedFilter, ...rest } = layer;
     layer = rest;
+  }
+  // Catalog metadata is written only when it says something: a record a
+  // plugin (or an older build) left blank, or with blank fields, is cleaned or
+  // dropped so an empty `descriptiveMetadata` block never reaches the file.
+  if (layer.descriptiveMetadata !== undefined) {
+    const { descriptiveMetadata: rawDescriptiveMetadata, ...rest } = layer;
+    const descriptiveMetadata = normalizeLayerDescriptiveMetadata(rawDescriptiveMetadata);
+    layer = descriptiveMetadata ? { ...rest, descriptiveMetadata } : rest;
   }
 
   // Some live plugin layers publish a large in-memory row model solely for
@@ -1877,6 +2065,52 @@ function prepareLayerForSave(layer: GeoLibreLayer): GeoLibreLayer {
     layer.metadata.externalNativeLayer === true &&
     layer.geojson &&
     (hasRestorableSourceUrl(layer) || isVectorControlLayer)
+  ) {
+    const { geojson: _geojson, ...rest } = layer;
+    layer = rest;
+  }
+
+  const wfsSourceUrl = layer.source.url;
+  let hasHttpWfsSource = false;
+  if (typeof wfsSourceUrl === "string") {
+    try {
+      const url = new URL(wfsSourceUrl);
+      hasHttpWfsSource = url.protocol === "http:" || url.protocol === "https:";
+    } catch {
+      hasHttpWfsSource = false;
+    }
+  }
+
+  // Host-managed WFS records reload through their persisted successful
+  // GetFeature URL. Keep unedited feature collections reference-only in saved
+  // projects. Edited geometry becomes authoritative embedded data, so omit
+  // the request URL in that saved copy; otherwise a later save/reopen could
+  // replace the edits with the service response.
+  if (
+    layer.type === "geojson" &&
+    layer.metadata.sourceKind === "wfs-getfeature" &&
+    layer.geojson &&
+    hasHttpWfsSource
+  ) {
+    if (hasGeometryEdits) {
+      const { url: _url, ...source } = layer.source;
+      layer = { ...layer, source };
+    } else if (!wfsCredentialsRedacted) {
+      const { geojson: _geojson, ...rest } = layer;
+      // Credential-bearing references are deliberately kept with their data.
+      layer = rest;
+    }
+  }
+
+  // An Add Vector Layer layer GeoLibre adopted (`maplibre-gl-vector-adopted`,
+  // ADOPTED_VECTOR_SOURCE_KIND in @geolibre/plugins) holds its features in
+  // `geojson`, but a URL-backed one saves the URL and is re-read through the
+  // control on reopen, like the control layer it was. A browser-picked file has
+  // no URL and keeps its features, like a drag-and-drop layer.
+  if (
+    layer.geojson &&
+    layer.metadata.sourceKind === "maplibre-gl-vector-adopted" &&
+    hasRestorableSourceUrl(layer)
   ) {
     const { geojson: _geojson, ...rest } = layer;
     layer = rest;
@@ -1958,6 +2192,32 @@ export function portableWmsTileUrl(tile: unknown): unknown {
   }
 }
 
+/**
+ * The store form of one project layer: its style completed from
+ * {@link DEFAULT_LAYER_STYLE} and the project's top-level `styles` entry.
+ *
+ * Legacy and externally-authored projects can carry a partial top-level style
+ * alongside newer fields on the layer itself. Those layer fields are kept,
+ * while the top-level copy stays authoritative where it explicitly supplies a
+ * value.
+ *
+ * @param project - The project the layer belongs to (for its `styles` map).
+ * @param layer - One of `project.layers`.
+ * @returns A new layer record ready for the store.
+ */
+export function hydrateProjectLayer(
+  project: Pick<GeoLibreProject, "styles">,
+  layer: GeoLibreLayer,
+): GeoLibreLayer {
+  const topLevel = project.styles?.[layer.id];
+  return {
+    ...layer,
+    style: topLevel
+      ? { ...DEFAULT_LAYER_STYLE, ...layer.style, ...topLevel }
+      : { ...DEFAULT_LAYER_STYLE, ...layer.style },
+  };
+}
+
 export function applyProjectToStore(project: GeoLibreProject): {
   projectName: string;
   mapView: MapViewState;
@@ -1982,18 +2242,10 @@ export function applyProjectToStore(project: GeoLibreProject): {
   primaryRenderer: MapRendererKind;
   projectStyleLibrary: StyleLibraryEntry[];
   comments: ProjectComment[];
+  projectInteraction: ProjectInteraction | null;
   metadata: Record<string, unknown>;
 } {
-  // Legacy and externally-authored projects can carry a partial top-level
-  // style alongside newer fields on the layer itself. Preserve those layer
-  // fields while keeping the top-level copy authoritative where it explicitly
-  // supplies a value.
-  const layers = project.layers.map((layer) => ({
-    ...layer,
-    style: project.styles[layer.id]
-      ? { ...DEFAULT_LAYER_STYLE, ...layer.style, ...project.styles[layer.id] }
-      : { ...DEFAULT_LAYER_STYLE, ...layer.style },
-  }));
+  const layers = project.layers.map((layer) => hydrateProjectLayer(project, layer));
   // Re-normalize here (even though `parseProject` already did) because
   // `applyProjectToStore` is a public entry point also reached directly by
   // programmatic/newProject loads that never passed through `parseProject`, so
@@ -2088,6 +2340,7 @@ export function applyProjectToStore(project: GeoLibreProject): {
     primaryRenderer: normalizePrimaryRenderer(project.primaryRenderer) ?? DEFAULT_PRIMARY_RENDERER,
     projectStyleLibrary: normalizeStyleLibraryEntries(project.styleLibrary),
     comments: scrubbedComments,
+    projectInteraction: normalizeProjectInteraction(project.interaction),
     metadata: project.metadata,
   };
 }

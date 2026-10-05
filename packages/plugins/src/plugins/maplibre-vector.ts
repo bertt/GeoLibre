@@ -4,6 +4,7 @@ import {
   effectiveLayerRenderState,
   getSpatialExtensionPath,
   hasPathTraversal,
+  shouldZoomToNewLayers,
   useAppStore,
 } from "@geolibre/core";
 import type { GeoLibreLayer, LayerGroup } from "@geolibre/core";
@@ -25,8 +26,11 @@ import type {
   GeoLibrePickedVectorFile,
 } from "../types";
 import {
+  adoptVectorControlLayers,
+  isAdoptedVectorLayer,
   isEmbeddableLocalVectorLayer,
   isVectorControlStoreLayer,
+  needsAdoptedVectorReplay,
   rememberControlVectorRenderState,
   resetVectorStoreSyncSuspension,
   resumeVectorStoreSync,
@@ -39,6 +43,7 @@ import {
 import { bridgeVectorControlToStore, exceedsCesiumVectorLimit } from "./vector-cesium-bridge";
 import { applyVectorContainerColors, groupVectorContainerImports } from "./vector-container-group";
 import { readableStacLayerHref } from "./stac-signing";
+import { focusPanel, restorePanelFocus } from "./panel-focus";
 import type { FeatureCollection } from "geojson";
 
 const vectorControlPosition: GeoLibreMapControlPosition = "top-left";
@@ -103,6 +108,14 @@ let vectorControl: VectorControl | null = null;
 let vectorControlMounted = false;
 let openPanelTimeout: number | null = null;
 let restorePanelExpandTimeout: number | null = null;
+/**
+ * The `projectGeneration` in which the user last opened the panel, or null once
+ * it is closed. A restore pass for that same project (the map finishing its
+ * first style load, a basemap swap) must not apply the project's saved panel
+ * state over the user's newer choice: opening Add Data → Vector Layer before
+ * the basemap loaded used to show the panel and then hide it again (#2895).
+ */
+let panelOpenedInGeneration: number | null = null;
 /**
  * Layer ids with an `addData` replay in flight, from project restore or from
  * replayVectorControlLayerById.
@@ -182,9 +195,13 @@ export function setKmlFileImportHandler(handler: KmlFileImportHandler | null): v
  * @param app - The GeoLibre app API.
  */
 export function openVectorLayerPanel(app: GeoLibreAppAPI): void {
+  const openedInGeneration = useAppStore.getState().projectGeneration;
   void (async () => {
     const control = await ensureVectorControl(app);
     if (!control) return;
+    // Recorded only once the control exists, so a failed open never makes a
+    // later restore skip the project's saved panel state.
+    panelOpenedInGeneration = openedInGeneration;
     // Defer by one task so the control finishes its mount cycle before the
     // panel is shown and expanded, matching the other standalone panels
     // (Earth Engine, 3D Tiles, raster); expanding in the same task as
@@ -205,6 +222,8 @@ export function openVectorLayerPanel(app: GeoLibreAppAPI): void {
         applyVectorPanelClass(control);
         wireDesktopFilePicker(control, app);
         wireKmlFileImporter(control);
+        // Take keyboard focus off the menu trigger and into the panel (#2895).
+        focusPanel((control as unknown as VectorControlInternals)._panel, VECTOR_CLOSE_SELECTOR);
       } catch (error) {
         console.error("[GeoLibre] Failed to open the vector layer panel", error);
       }
@@ -215,6 +234,7 @@ export function openVectorLayerPanel(app: GeoLibreAppAPI): void {
 }
 
 export function closeVectorLayerPanel(app: GeoLibreAppAPI): void {
+  panelOpenedInGeneration = null;
   if (openPanelTimeout !== null) {
     window.clearTimeout(openPanelTimeout);
     openPanelTimeout = null;
@@ -279,7 +299,9 @@ export async function getVectorLayerPropertyValues(
  * @param app - The GeoLibre app API.
  */
 export function restoreVectorLayers(app: GeoLibreAppAPI): void {
-  const hasVectorLayers = useAppStore.getState().layers.some(isVectorControlStoreLayer);
+  // Adopted layers ride along: one saved by URL or path has no features until
+  // the control reads them again, and adoption then hands them back.
+  const hasVectorLayers = useAppStore.getState().layers.some(needsVectorControlReplay);
   if (!hasVectorLayers && !vectorControl) return;
 
   void (async () => {
@@ -291,7 +313,7 @@ export function restoreVectorLayers(app: GeoLibreAppAPI): void {
     const storeLayerIds = new Set(
       useAppStore
         .getState()
-        .layers.filter(isVectorControlStoreLayer)
+        .layers.filter(needsVectorControlReplay)
         .map((layer) => layer.id),
     );
 
@@ -316,7 +338,11 @@ export function restoreVectorLayers(app: GeoLibreAppAPI): void {
       // Isolated so a DOM error from the panel-state restore cannot abort
       // the layer replay below.
       try {
-        applyRestoredVectorPanelState(control, panelCollapsed);
+        // The user opened the panel after this project loaded, so their choice
+        // is newer than the saved state; leave the panel as they left it.
+        if (panelOpenedInGeneration !== useAppStore.getState().projectGeneration) {
+          applyRestoredVectorPanelState(control, panelCollapsed);
+        }
       } catch (error) {
         console.error("[GeoLibre] Failed to restore vector panel state", error);
       }
@@ -329,7 +355,7 @@ export function restoreVectorLayers(app: GeoLibreAppAPI): void {
         useAppStore.getState().layerGroups.map((group) => [group.id, group] as const),
       );
       for (const layer of useAppStore.getState().layers) {
-        if (!isVectorControlStoreLayer(layer)) continue;
+        if (!needsVectorControlReplay(layer)) continue;
         // Project loading can invoke this restore pass more than once before
         // the first pass finishes. addData does not expose the layer through
         // getLayer until its async ingest completes, so getLayer alone lets the
@@ -473,6 +499,17 @@ export function restoreVectorLayers(app: GeoLibreAppAPI): void {
 }
 
 /**
+ * Whether a store layer's data has to come from the vector control: a
+ * control-drawn layer, or an adopted one saved without its features.
+ *
+ * @param layer - A store layer.
+ * @returns True when restore or refresh must replay it through the control.
+ */
+function needsVectorControlReplay(layer: GeoLibreLayer): boolean {
+  return isVectorControlStoreLayer(layer) || needsAdoptedVectorReplay(layer);
+}
+
+/**
  * Replays one saved Add Vector Layer layer into the control, preserving its
  * id, name, visibility, opacity, and persisted render/style state. The source
  * is a URL (URL-backed layers), a File re-read from disk (desktop local-file
@@ -545,6 +582,7 @@ export function replayVectorLayer(
  * record of it, which is why {@link reloadVectorControlLayer} returns undefined
  * for it. The layer panel's refresh (the button and the auto-refresh tick)
  * falls through to this, so the next successful fetch brings the layer back.
+ * The same path refreshes an adopted layer, which the control never holds.
  *
  * URL-backed only. A local-file layer needs the host's filesystem reader, which
  * lives with the restore path rather than in this module, and an embedded-source
@@ -573,7 +611,11 @@ export async function replayVectorControlLayerById(
 
   const state = useAppStore.getState();
   const layer = state.layers.find((candidate) => candidate.id === id);
-  if (!layer || !isVectorControlStoreLayer(layer)) return undefined;
+  // An adopted layer is never in the control, so refreshing one always lands
+  // here: the replay re-fetches the URL and adoption swaps the new features in.
+  if (!layer || !(isVectorControlStoreLayer(layer) || isAdoptedVectorLayer(layer))) {
+    return undefined;
+  }
 
   const url = typeof layer.source.url === "string" && layer.source.url ? layer.source.url : null;
   if (!url) return undefined;
@@ -941,10 +983,85 @@ function createVectorControl(
     applyVectorContainerColors(ids, style);
     useAppStore.getState().addLayerGroup(name, ids);
   });
+  // After the container grouping above, so its addData wrapper runs inside this
+  // one and a container's tables are grouped before they are adopted.
+  wireVectorAdoption(control);
   wireVectorStoreSync(control);
   patchVectorControlOnRemove(control, panelStateSyncHandler);
+  defaultVectorFitToPreference(control);
 
   return control;
+}
+
+/**
+ * Makes the control's "fit to the new layer" default follow the project's
+ * Map Preferences instead of the upstream `true`.
+ *
+ * The control's own panel calls `control.addData` without `fitBounds`, so the
+ * instance method is wrapped; a caller that passes `fitBounds` explicitly
+ * (project restore passes `false`) is left alone.
+ *
+ * @param control - The vector control whose `addData` is wrapped.
+ */
+function defaultVectorFitToPreference(control: VectorControl): void {
+  const addData = control.addData.bind(control);
+  control.addData = (source, options) =>
+    addData(source, {
+      ...options,
+      fitBounds: options?.fitBounds ?? shouldZoomToNewLayers(),
+    });
+}
+
+/**
+ * Adopts the control's small GeoJSON-mode layers into GeoLibre once they have
+ * loaded, so a layer added through Add Vector Layer gets the same Style panel
+ * as a drag-and-drop one (opengeos/GeoLibre#2715). See
+ * {@link adoptVectorControlLayers} for what stays with the control.
+ *
+ * Every load goes through `addData` (the panel's own inputs, a dropped
+ * container, a URL add, a project restore), so wrapping it catches them all.
+ * Adoption waits for the load to settle, and runs a task later, for two
+ * reasons: a container import groups its tables when its `addData` resolves,
+ * and callers such as {@link addVectorFileToMap} count the new layers in the
+ * control right after awaiting it. The layer events cover the remaining ways a
+ * layer becomes adoptable, such as a render-mode switch in the panel.
+ *
+ * @param control - The vector control to wire.
+ */
+function wireVectorAdoption(control: VectorControl): void {
+  // Ids of loads still in flight. A container's tables are `${id}-<table>`, so
+  // they are held back by prefix until their own load settles.
+  const loading = new Set<string>();
+  const isLoading = (id: string) => {
+    for (const prefix of loading) {
+      if (id === prefix || id.startsWith(`${prefix}-`)) return true;
+    }
+    return false;
+  };
+  let timer: number | null = null;
+  const schedule = () => {
+    if (timer !== null) return;
+    timer = window.setTimeout(() => {
+      timer = null;
+      // A control torn down since (a renderer switch) has no layers to hand over.
+      if (control !== vectorControl) return;
+      void adoptVectorControlLayers(control, { skip: isLoading });
+    }, 0);
+  };
+
+  const addData = control.addData.bind(control);
+  control.addData = async (source, options: VectorLayerOptions = {}) => {
+    const id = options.id ?? crypto.randomUUID();
+    loading.add(id);
+    try {
+      return await addData(source, { ...options, id });
+    } finally {
+      loading.delete(id);
+      schedule();
+    }
+  };
+  control.on("layeradded", schedule);
+  control.on("layerupdated", schedule);
 }
 
 function patchVectorControlOnRemove(
@@ -1057,18 +1174,24 @@ function applyVectorPanelClass(control: VectorControl): void {
   internals._panel?.classList.add(VECTOR_PANEL_CLASS);
 }
 
+const VECTOR_CLOSE_SELECTOR = ".vector-control-close";
+
 // The upstream close button only collapses the panel, leaving the map
 // button visible. Hide the whole control too so closing the panel restores
 // the pre-open map, like dismissing the dialog it replaces. Loaded layers
 // keep rendering; the layer panel still manages them.
 function wireVectorCloseButton(control: VectorControl): void {
   const panel = (control as unknown as VectorControlInternals)._panel;
-  const closeButton = panel?.querySelector<HTMLElement>(".vector-control-close");
+  const closeButton = panel?.querySelector<HTMLElement>(VECTOR_CLOSE_SELECTOR);
   if (!closeButton || closeButton.dataset.geolibreCloseWired === "true") {
     return;
   }
   closeButton.dataset.geolibreCloseWired = "true";
-  closeButton.addEventListener("click", () => hideVectorControl(control));
+  closeButton.addEventListener("click", () => {
+    panelOpenedInGeneration = null;
+    restorePanelFocus(panel);
+    hideVectorControl(control);
+  });
 }
 
 // On desktop the host can read a chosen `.shp`'s sidecar files from the same

@@ -32,11 +32,13 @@ export {
   isRasterFileName,
   isHttpUrl,
   isAbsoluteLocalPath,
+  isGeojsonSourcePath,
 } from "./file-io/paths";
 export {
   listDirectory,
   readLocalFileBytes,
   readLocalFileText,
+  writeLocalGeojsonFile,
   writeTextFileToPath,
   type LocalDirectoryEntry,
 } from "./file-io/local-fs";
@@ -83,6 +85,7 @@ export {
 } from "./file-io/file-dialogs";
 export {
   openProjectFile,
+  type OpenedProjectFile,
   openQgisProjectFile,
   openArcgisProjectFile,
   RecentProjectGoneError,

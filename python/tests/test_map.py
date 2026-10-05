@@ -365,6 +365,29 @@ def test_add_pmtiles(m):
     assert layer["metadata"]["sourceLayers"] == ["roads"]
 
 
+def test_add_lidar(m):
+    layer_id = m.add_lidar("https://example.com/data/autzen.copc.laz?token=1")
+    layer = next(item for item in m.project["layers"] if item["id"] == layer_id)
+    assert layer["type"] == "lidar"
+    # The default name is the file name, without the query string.
+    assert layer["name"] == "autzen.copc.laz"
+    assert layer["sourcePath"] == "https://example.com/data/autzen.copc.laz?token=1"
+    assert m.add_lidar("https://example.com/cloud/", name="Mine") != layer_id
+    assert m.project["layers"][-1]["name"] == "Mine"
+    trailing = m.add_lidar("https://example.com/ept/")
+    assert next(i for i in m.project["layers"] if i["id"] == trailing)["name"] == "ept"
+
+
+def test_point_cloud_annotations_empty_by_default(m):
+    assert m.point_cloud_annotations() == {
+        "labels": {},
+        "instances": {},
+        "boxes": [],
+        "vectors": [],
+        "classes": [],
+    }
+
+
 def test_add_3d_tiles(m):
     m.add_3d_tiles("https://e/tileset.json", altitude_offset=5)
     layer = _last_layer(m)
@@ -1151,6 +1174,15 @@ def test_add_legend_from_dict(m):
         {"label": "Water", "color": "#0000ff", "shape": "square"},
         {"label": "Land", "color": "#00ff00", "shape": "square"},
     ]
+
+
+def test_set_map_legend(m):
+    m.set_map_legend("Cases per 100k", position="bottom-right", collapsed=True)
+    legend = m.project["legend"]
+    assert legend["title"] == "Cases per 100k"
+    assert legend["panelPosition"] == "bottom-right"
+    assert legend["panelVisible"] is True
+    assert legend["panelCollapsed"] is True
 
 
 def test_add_legend_from_labels_and_colors(m):

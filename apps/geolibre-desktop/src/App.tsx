@@ -3,9 +3,11 @@ import { Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useCallback, useState } from "react";
 import { DesktopShell } from "./components/layout/DesktopShell";
+import { NotificationRegion } from "./components/layout/NotificationRegion";
 import { OnboardingDialog } from "./components/layout/OnboardingDialog";
 import { UpdateNotificationModal } from "./components/layout/UpdateNotificationModal";
 import { useDesktopSettingsPersistence } from "./hooks/useDesktopSettings";
+import "./lib/s3-signer-setup";
 import { useLayoutOptions } from "./hooks/useLayoutOptions";
 import { useProjectUrlLoader } from "./hooks/useProjectUrlLoader";
 import { useDataUrlLoader } from "./hooks/useDataUrlLoader";
@@ -16,6 +18,7 @@ import { useLayerLibraryPersistence } from "./hooks/useLayerLibraryPersistence";
 import { useLastBasemapPersistence } from "./hooks/useLastBasemapPersistence";
 import { useLastRendererPersistence } from "./hooks/useLastRendererPersistence";
 import { useStyleLibraryPersistence } from "./hooks/useStyleLibraryPersistence";
+import { useStartupLayerStyles } from "./hooks/useStartupLayerStyles";
 import { useTemplateLibraryPersistence } from "./hooks/useTemplateLibraryPersistence";
 import { useRuntimeEnvironmentVariables } from "./hooks/useRuntimeEnvironmentVariables";
 import { useStartupUpdateCheck } from "./hooks/useStartupUpdateCheck";
@@ -53,9 +56,9 @@ export default function App() {
   useDesktopSettingsPersistence();
   useThemeScheme();
   useRecentProjectsPersistence();
-  const { warning: startupProjectWarning, restoring: restoringStartupProject } =
-    useStartupProject();
+  const { restoring: restoringStartupProject } = useStartupProject();
   useStyleLibraryPersistence();
+  useStartupLayerStyles();
   useLayerLibraryPersistence();
   useTemplateLibraryPersistence();
   useRuntimeEnvironmentVariables();
@@ -90,19 +93,14 @@ export default function App() {
           <OnboardingDialog open={showOnboarding} onClose={dismissOnboarding} />
         </>
       )}
+      {/* Mounted once, outside the startup-restore branch, so a failure raised
+          while the shell is unmounted still reaches the user. */}
+      <NotificationRegion />
       <UpdateNotificationModal
         pending={pendingUpdate}
         onRemindLater={remindLater}
         onSkipVersion={skipVersion}
       />
-      {startupProjectWarning ? (
-        <div
-          role="alert"
-          className="fixed bottom-10 left-1/2 z-50 -translate-x-1/2 rounded-md border bg-background px-4 py-3 text-sm shadow-lg"
-        >
-          {startupProjectWarning}
-        </div>
-      ) : null}
     </DirectionProvider>
   );
 }

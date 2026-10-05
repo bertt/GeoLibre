@@ -9,6 +9,7 @@ import {
   effectiveLayerRenderState,
   getActiveEllipsoid,
   IDENTIFY_ALL_LAYERS_ID,
+  identifyAllIncludes,
   isDuckDBQueryLayer,
   isPopupClickEnabled,
   isPopupHoverEnabled,
@@ -47,6 +48,7 @@ import {
   isAbortError,
   isPixelIdentifyLayer,
   isWmsLayer,
+  isWmsQueryable,
   pixelIdentifyProperties,
   timeSliderBridge,
 } from "./identify-sources";
@@ -57,8 +59,14 @@ import {
   type GlobalIdentifyHit,
   type MapCanvasIdentifyAllLabels,
 } from "./identify-all-popup";
+import {
+  createIdentifyEditActionsElement,
+  type MapCanvasIdentifyEditActions,
+} from "./identify-edit-actions";
 
-export type { MapCanvasIdentifyAllLabels };
+export type { MapCanvasIdentifyAllLabels, MapCanvasIdentifyEditActions };
+import type { MapCanvasRasterIdentify } from "./raster-identify";
+export type { MapCanvasRasterIdentify, MapCanvasRasterIdentifyResult } from "./raster-identify";
 import { createMapController, type MapController } from "./map-controller";
 import type { MapEngine } from "./map-engine";
 import {
@@ -94,28 +102,24 @@ export interface MapCanvasProps {
   identifyAllLabels?: MapCanvasIdentifyAllLabels;
   /** Reads app-owned raster layers for the grouped, all-layer Identify popup. */
   identifyRasterLayerAt?: MapCanvasRasterIdentify;
+  /**
+   * Edit geometry / Edit attributes actions shown on vector Identify results
+   * (#2932). Omitted, Identify results offer no edit actions.
+   */
+  identifyEditActions?: MapCanvasIdentifyEditActions;
 }
 
 function setMapLibreIdentifyCursor(map: maplibregl.Map, active: boolean): void {
-  // MapLibre's grab cursor belongs to the interactive canvas container. Its
-  // native crosshair mode covers that container and active/drag states, while
-  // the inline value keeps the canvas itself explicit for other cursor owners.
-  map.getContainer().classList.toggle("maplibregl-crosshair", active);
-  map.getCanvas().style.cursor = active ? "crosshair" : "";
+  // MapLibre's grab cursor belongs to the interactive canvas container, so the
+  // crosshair goes there as well as on the canvas. It is inline rather than
+  // MapLibre's `maplibregl-crosshair` class: that class is BoxZoom's, and every
+  // camera move (jumpTo, easeTo, fitBounds) resets the gesture handlers, which
+  // strips it and hands the container back its grab cursor (#2879). An inline
+  // value also outranks the stylesheet's `:active` grabbing cursor.
+  const cursor = active ? "crosshair" : "";
+  map.getCanvasContainer().style.cursor = cursor;
+  map.getCanvas().style.cursor = cursor;
 }
-
-/** One raster result supplied by the application to all-layer Identify. */
-export interface MapCanvasRasterIdentifyResult {
-  properties: Record<string, unknown>;
-  title?: string;
-}
-
-/** Application bridge for raster sources owned outside `@geolibre/map`. */
-export type MapCanvasRasterIdentify = (
-  layer: GeoLibreLayer,
-  lngLat: [number, number],
-  options: { signal: AbortSignal },
-) => Promise<MapCanvasRasterIdentifyResult | null>;
 
 function createIdentifyMessagePopupElement(layerName: string, message: string): HTMLElement {
   return createIdentifyPopupElement(layerName, { status: message });
@@ -236,6 +240,7 @@ export const MapCanvas = memo(function MapCanvas({
   canUseRemoteElevation,
   identifyAllLabels = DEFAULT_IDENTIFY_ALL_LABELS,
   identifyRasterLayerAt,
+  identifyEditActions,
 }: MapCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const controller = useRef<MapController | null>(null);
@@ -255,11 +260,15 @@ export const MapCanvas = memo(function MapCanvas({
   const mapPreferences = useAppStore((s) => s.preferences.map);
   const mapView = useAppStore((s) => s.mapView);
   const layers = useAppStore((s) => s.layers);
+  const hoverTooltipsEnabled = useAppStore((s) => s.hoverTooltipsEnabled);
   const layerGroups = useAppStore((s) => s.layerGroups);
   const layerGroupsRef = useRef(layerGroups);
   // Read by the photo-popup effect, which rebinds only on photo-layer changes.
   const identifyLabelsRef = useRef(identifyAllLabels);
   identifyLabelsRef.current = identifyAllLabels;
+  // Read at click time, so a new actions object does not rebind Identify.
+  const identifyEditActionsRef = useRef(identifyEditActions);
+  identifyEditActionsRef.current = identifyEditActions;
   layerGroupsRef.current = layerGroups;
   const selectedLayerId = useAppStore((s) => s.selectedLayerId);
   const selectedFeatureId = useAppStore((s) => s.selectedFeatureId);
@@ -613,8 +622,12 @@ export const MapCanvas = memo(function MapCanvas({
         // when handed the array form, so fold every candidate against one map
         // built once per click instead of one per layer.
         const groupById = new Map(layerGroupsRef.current.map((group) => [group.id, group]));
+        // Read at click time: a restriction set by a script or project names
+        // the layers this mode is limited to (issue #2688).
+        const { identifyLayerIds } = useAppStore.getState();
         const eligibleLayers = layers.filter(
           (candidate) =>
+            identifyAllIncludes(candidate.id, identifyLayerIds) &&
             effectiveLayerRenderState(candidate, groupById).visible &&
             resolveLayerCapabilities(candidate).query &&
             isPopupClickEnabled(candidate.popup),
@@ -715,13 +728,18 @@ export const MapCanvas = memo(function MapCanvas({
             activate,
             identifyAllLabels,
             widest,
+            identifyEditActionsRef.current,
+            () => {
+              identifyPopup.current?.remove();
+              identifyPopup.current = null;
+            },
           );
           showPopup(content, identifyPopupShellMaxWidth(widest ? { maxWidth: widest } : undefined));
         };
 
         const asyncLayers = eligibleLayers.filter(
           (candidate) =>
-            isWmsLayer(candidate) ||
+            (isWmsLayer(candidate) && isWmsQueryable(candidate)) ||
             isPixelIdentifyLayer(candidate) ||
             candidate.type === "cog" ||
             candidate.metadata.sourceKind === NETCDF_IMAGE_SOURCE_KIND,
@@ -980,6 +998,16 @@ export const MapCanvas = memo(function MapCanvas({
         return;
       }
 
+      if (isWmsLayer(layer) && !isWmsQueryable(layer)) {
+        // The capabilities say this layer answers no GetFeatureInfo (#2887).
+        wmsIdentifyAbortController?.abort();
+        selectFeature(null);
+        showIdentifyPopup(
+          createIdentifyMessagePopupElement(layer.name, identifyAllLabels.wmsNotQueryable),
+        );
+        return;
+      }
+
       if (isWmsLayer(layer)) {
         wmsIdentifyAbortController?.abort();
         const abortController = new AbortController();
@@ -1041,13 +1069,27 @@ export const MapCanvas = memo(function MapCanvas({
         }
 
         selectFeature(result.featureId);
-        showIdentifyPopup(
-          createIdentifyPopupElement(layer.name, result.properties, result.featureId, {
+        const content = createIdentifyPopupElement(
+          layer.name,
+          result.properties,
+          result.featureId,
+          {
             popup: layer.popup,
             fieldVisibility: layer.fieldVisibility,
             zoom: map.getZoom(),
-          }),
+          },
         );
+        // DuckDB rows are editable in the attribute table too, as in the
+        // grouped popup.
+        const editRow = createIdentifyEditActionsElement(
+          layer,
+          result.featureId,
+          identifyEditActionsRef.current,
+          identifyAllLabels,
+          () => removeIdentifyPopup(),
+        );
+        if (editRow) content.firstElementChild?.after(editRow);
+        showIdentifyPopup(content);
         return;
       }
 
@@ -1066,15 +1108,28 @@ export const MapCanvas = memo(function MapCanvas({
       }
 
       const featureId = findFeatureId(layer, feature);
-      showResolvedHitPopup(
-        createIdentifyPopupElement(layer.name, feature.properties ?? {}, featureId ?? feature.id, {
+      const content = createIdentifyPopupElement(
+        layer.name,
+        feature.properties ?? {},
+        featureId ?? feature.id,
+        {
           popup: layer.popup,
           fieldVisibility: layer.fieldVisibility,
           feature,
           zoom: map.getZoom(),
-        }),
-        featureId,
+        },
       );
+      const editRow = createIdentifyEditActionsElement(
+        layer,
+        featureId,
+        identifyEditActionsRef.current,
+        identifyAllLabels,
+        // Programmatic: the edit action owns the selection from here.
+        () => removeIdentifyPopup(),
+      );
+      // Under the title, above the attribute rows.
+      if (editRow) content.firstElementChild?.after(editRow);
+      showResolvedHitPopup(content, featureId);
     };
 
     map.on("click", handleIdentifyClick);
@@ -1204,21 +1259,23 @@ export const MapCanvas = memo(function MapCanvas({
   // fields in the Style panel rebinds immediately.
   const hoverTooltipKey = useMemo(
     () =>
-      layers
-        // Group-aware, like the Identify handler and the selection query: a
-        // layer whose own switch is on can still be hidden by its group, and
-        // binding pointer handlers to it would be binding to something the
-        // user cannot see. `applyGroupEffects` also sets the synced MapLibre
-        // layer's visibility to `none`, so nothing fires today either way —
-        // this keeps the two from drifting if that ever stops being true.
-        .filter(
-          (layer) =>
-            effectiveLayerRenderState(layer, layerGroups).visible &&
-            isPopupHoverEnabled(layer.popup),
-        )
-        .map((layer) => `${layer.id}\u0000${JSON.stringify(layer.popup ?? {})}`)
-        .join("\u0001"),
-    [layers, layerGroups],
+      !hoverTooltipsEnabled
+        ? ""
+        : layers
+            // Group-aware, like the Identify handler and the selection query: a
+            // layer whose own switch is on can still be hidden by its group, and
+            // binding pointer handlers to it would be binding to something the
+            // user cannot see. `applyGroupEffects` also sets the synced MapLibre
+            // layer's visibility to `none`, so nothing fires today either way —
+            // this keeps the two from drifting if that ever stops being true.
+            .filter(
+              (layer) =>
+                effectiveLayerRenderState(layer, layerGroups).visible &&
+                isPopupHoverEnabled(layer.popup),
+            )
+            .map((layer) => `${layer.id}\u0000${JSON.stringify(layer.popup ?? {})}`)
+            .join("\u0001"),
+    [layers, layerGroups, hoverTooltipsEnabled],
   );
 
   useEffect(() => {

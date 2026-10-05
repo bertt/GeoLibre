@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import type { FeatureCollection } from "geojson";
+import type { Feature, FeatureCollection } from "geojson";
 import type { GeoLibreLayer } from "../packages/core/src/types";
 import {
   GEOMAN_SHAPE_PROPERTIES,
@@ -13,7 +13,9 @@ import {
   captureEditedProperties,
   planGeoEditorOverlayOrder,
   reconcileEditedFeatures,
+  removeMultiLineStringVertex,
   tagFeatureKeys,
+  findGeometryEditFeature,
 } from "../packages/plugins/src/plugins/geo-editor-geometry";
 
 function makeLayer(overrides: Partial<GeoLibreLayer>): GeoLibreLayer {
@@ -175,6 +177,31 @@ describe("tagFeatureKeys", () => {
     assert.equal(collection.features[0].properties?.[GEOMETRY_EDIT_FID_PROPERTY], undefined);
   });
 
+  it("gives an id-less feature its array index, as Identify and the table do", () => {
+    // Identify's Edit geometry finds its feature by this tag (#2932).
+    const tagged = tagFeatureKeys({
+      type: "FeatureCollection",
+      features: [point(42), point(undefined), point(undefined)],
+    });
+    assert.deepEqual(
+      tagged.features.map((f) => f.properties?.[GEOMETRY_EDIT_FID_PROPERTY]),
+      ["42", "1", "2"],
+    );
+  });
+
+  it("keeps an explicit id even when an earlier id-less index would claim it", () => {
+    // Identify resolves the third feature as "1" (its own id), so the editor
+    // must tag it "1"; the id-less feature at index 1 gets a fresh id instead.
+    const tagged = tagFeatureKeys({
+      type: "FeatureCollection",
+      features: [point(undefined), point(undefined), point("1")],
+    });
+    const tags = tagged.features.map((f) => f.properties?.[GEOMETRY_EDIT_FID_PROPERTY]);
+    assert.equal(tags[0], "0");
+    assert.equal(tags[2], "1");
+    assert.equal(new Set(tags).size, 3);
+  });
+
   it("assigns unique ids when the input has duplicate ids", () => {
     const tagged = tagFeatureKeys({
       type: "FeatureCollection",
@@ -225,9 +252,11 @@ describe("reconcileEditedFeatures", () => {
       features: [point(5), point(12), point(undefined)],
     };
     const reconciled = reconcileEditedFeatures(tagFeatureKeys(original));
+    // The id-less feature keeps its array index, the id the attribute table
+    // already gave it, so a save does not renumber it.
     assert.deepEqual(
       reconciled.features.map((f) => String(f.id)),
-      ["5", "12", "0"],
+      ["5", "12", "2"],
     );
   });
 
@@ -760,5 +789,165 @@ describe("editor tracking — copied and id-less features", () => {
 
     const result = applySyncedEditorTracking(editorCopy, stored, keyOf, stamp);
     assert.equal(result.features[0].properties?.created_at, "2026-08-01T00:00:00.000Z");
+  });
+});
+
+describe("removeMultiLineStringVertex", () => {
+  const multi = (coordinates: number[][][]) => ({ type: "MultiLineString" as const, coordinates });
+
+  it("removes the vertex from the part that holds it", () => {
+    const geometry = multi([
+      [
+        [0, 0],
+        [1, 1],
+        [2, 0],
+      ],
+      [
+        [5, 5],
+        [6, 6],
+      ],
+    ]);
+    assert.deepEqual(removeMultiLineStringVertex(geometry, [1, 1]), {
+      type: "MultiLineString",
+      coordinates: [
+        [
+          [0, 0],
+          [2, 0],
+        ],
+        [
+          [5, 5],
+          [6, 6],
+        ],
+      ],
+    });
+    // The input is left alone.
+    assert.equal(geometry.coordinates[0].length, 3);
+  });
+
+  it("drops a part left with fewer than two vertices", () => {
+    const geometry = multi([
+      [
+        [0, 0],
+        [1, 1],
+        [2, 0],
+      ],
+      [
+        [5, 5],
+        [6, 6],
+      ],
+    ]);
+    assert.deepEqual(removeMultiLineStringVertex(geometry, [6, 6])?.coordinates, [
+      [
+        [0, 0],
+        [1, 1],
+        [2, 0],
+      ],
+    ]);
+  });
+
+  it("returns null once no part is left", () => {
+    const geometry = multi([
+      [
+        [0, 0],
+        [1, 1],
+      ],
+    ]);
+    assert.equal(removeMultiLineStringVertex(geometry, [0, 0]), null);
+  });
+
+  it("uses the marker path to pick between repeated coordinates", () => {
+    const geometry = multi([
+      [
+        [0, 0],
+        [1, 1],
+      ],
+      [
+        [1, 1],
+        [2, 2],
+        [3, 3],
+      ],
+    ]);
+    const path = ["geometry", "coordinates", 1, 0];
+    assert.deepEqual(removeMultiLineStringVertex(geometry, [1, 1], path)?.coordinates, [
+      [
+        [0, 0],
+        [1, 1],
+      ],
+      [
+        [2, 2],
+        [3, 3],
+      ],
+    ]);
+  });
+
+  it("removes the closing vertex of a closed part when the path points at it", () => {
+    const geometry = multi([
+      [
+        [0, 0],
+        [1, 0],
+        [1, 1],
+        [0, 0],
+      ],
+    ]);
+    const path = ["geometry", "coordinates", 0, 3];
+    assert.deepEqual(removeMultiLineStringVertex(geometry, [0, 0], path)?.coordinates, [
+      [
+        [0, 0],
+        [1, 0],
+        [1, 1],
+      ],
+    ]);
+  });
+
+  it("ignores a stale path and matches on the coordinate", () => {
+    const geometry = multi([
+      [
+        [0, 0],
+        [1, 1],
+        [2, 2],
+      ],
+    ]);
+    const path = ["geometry", "coordinates", 0, 0];
+    assert.deepEqual(removeMultiLineStringVertex(geometry, [2, 2], path)?.coordinates, [
+      [
+        [0, 0],
+        [1, 1],
+      ],
+    ]);
+  });
+
+  it("returns undefined for a vertex that isn't there", () => {
+    assert.equal(
+      removeMultiLineStringVertex(
+        multi([
+          [
+            [0, 0],
+            [1, 1],
+          ],
+        ]),
+        [9, 9],
+      ),
+      undefined,
+    );
+  });
+});
+
+describe("findGeometryEditFeature", () => {
+  it("finds the feature Identify named through the session tag", () => {
+    const tagged = tagFeatureKeys({
+      type: "FeatureCollection",
+      features: [point(42, { name: "a" }), point(undefined, { name: "b" })],
+    });
+    assert.equal(findGeometryEditFeature(tagged, "1")?.properties?.name, "b");
+    assert.equal(findGeometryEditFeature(tagged, "42")?.properties?.name, "a");
+  });
+
+  it("returns undefined for an unknown id or untagged features", () => {
+    const tagged = tagFeatureKeys({ type: "FeatureCollection", features: [point(undefined)] });
+    assert.equal(findGeometryEditFeature(tagged, "7"), undefined);
+    assert.equal(
+      findGeometryEditFeature({ type: "FeatureCollection", features: [point("0")] }, "0"),
+      undefined,
+    );
   });
 });

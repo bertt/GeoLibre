@@ -142,6 +142,9 @@ m.add_choropleth(
 Add a legend, a colorbar, and a swipe (split-map) comparison:
 
 ```python
+# The app's legend panel (Controls > Legend), built from each layer's style.
+m.set_map_legend("Population", position="bottom-right")
+
 # A built-in land-cover legend, or your own {label: color} dict.
 m.add_legend(builtin="nlcd")
 m.add_legend(legend_dict={"Water": "#0000ff", "Land": "#00ff00"})
@@ -177,7 +180,8 @@ m2
 ```
 
 `to_project()`, `save_project()`, and `to_html()` redact credentials — API keys,
-tokens, authenticated request headers, environment variables, geocoder keys, and
+tokens, authenticated request headers, secret environment variables (every row
+not marked `"secret": false`), geocoder keys, and
 credential URL parameters — so anything you serialize, commit, or share is safe
 by default. Pass `keep_credentials=True` to `to_project()` or `save_project()`
 for a trusted local file that must keep working without re-entering them:
@@ -267,7 +271,7 @@ m.on_layer_change(lambda e: print("layers", e["layerIds"]))
 | `list_algorithms()` | Available processing algorithms (`id`, `parameters`, …). |
 | `run_algorithm(id, parameters=None, timeout=)` | Run an algorithm; returns `{logs, resultLayerIds}`. |
 | `to_image(path=None, timeout=)` | Capture the map as PNG bytes, or write to `path`. |
-| `to_html(path=None, title=, width=, height=, app_url=)` | Export a standalone HTML page that embeds the current project (credentials redacted); returns the HTML or writes to `path`. |
+| `to_html(path=None, title=, width=, height=, app_url=)` | Export a standalone HTML page that embeds the current project (credentials redacted) in this map's `layout` and `theme`; returns the HTML or writes to `path`. |
 | `on(event, cb)` / `on_click` / `on_selection_change` / `on_layer_change` | Register event callbacks; returns an unsubscribe function. |
 | `request(method, params=None, timeout=)` | Low-level command primitive behind the methods above. |
 
@@ -296,11 +300,16 @@ m.on_layer_change(lambda e: print("layers", e["layerIds"]))
 | `add_pmtiles(url, name=, tile_type=, source_layers=, **style)` | Add a PMTiles archive (vector or raster). |
 | `add_tile_layer(url, name=, tile_size=, attribution=)` | Add a raster XYZ tile layer. |
 | `add_ee_layer(ee_object, vis_params=, name=, shown=, opacity=)` | Add an authenticated Google Earth Engine object as raster tiles (needs `earthengine-api`). |
-| `add_wms(endpoint, layers, name=, styles=, image_format=, transparent=, tile_size=, version=, crs=, bounds=, **style)` | Add a WMS layer (GetMap, tiled raster). `bounds` is `[west, south, east, north]`, needed for zoom-to-layer. `crs` defaults to `EPSG:3857`; for a server without Web Mercator pass a geographic CRS it lists (`EPSG:4326`, `EPSG:4258`, `EPSG:6706`, or `CRS:84` with `version="1.3.0"`; no others). Only the desktop app redraws those tiles into Web Mercator: the web build and `export_html` pages still send the Web Mercator BBOX, so such a layer stays blank there. |
+| `add_wms(endpoint, layers, name=, styles=, image_format=, transparent=, tile_size=, version=, crs=, bounds=, **style)` | Add a WMS layer (GetMap, tiled raster). `bounds` is `[west, south, east, north]`, needed for zoom-to-layer. `crs` defaults to `EPSG:3857`; for a server without Web Mercator pass a CRS it lists: preferably a geographic one (`EPSG:4326`, `EPSG:4258`, `EPSG:6706`, or `CRS:84` with `version="1.3.0"`), otherwise a projected `EPSG:<code>` such as `EPSG:25832`, which the desktop app warps from its EPSG tables. Only the desktop app redraws those tiles into Web Mercator: the web build and `export_html` pages still send the Web Mercator BBOX, so such a layer stays blank there. |
 | `add_wmts(url, name=, tile_size=, bounds=, **style)` | Add a WMTS layer from a tile URL template. |
 | `add_wfs(endpoint, type_name, name=, version=, output_format=, srs_name=, max_features=, **style)` | Add a WFS layer (GetFeature GeoJSON, fetched and inlined). |
 | `add_cog(url, name=, bands=, colormap=, rescale=, **style)` | Add a Cloud Optimized GeoTIFF (URL or a kernel-side local GeoTIFF path). |
 | `add_raster(source, name=, bands=, colormap=, rescale=, array_args=, **style)` | Add a COG/GeoTIFF URL or path, or an xarray DataArray/Dataset (xarray needs `geolibre[raster]`). |
+| `add_lidar(url, name=None, **style)` | Add a LAS, LAZ, COPC or EPT point cloud by URL (COPC/EPT stream by level of detail). |
+| `point_cloud_annotations()` | Read the point labels, instance ids, custom classes, 3D boxes and 3D vectors saved by the app's [point cloud annotator](user-guide/point-cloud-annotation.md). Labels and instance ids are keyed by source URL, then node key and point index; `geolibre.project.apply_point_labels` writes a whole-file source's labels onto `laspy` classification. |
+| `prelabel_point_cloud(url, input_file, tool="ground")` | Run the annotator's Whitebox pre-label on a local copy of a LiDAR layer and save the changed classes as its labels (`ground` or `ground-vegetation`; needs `geolibre[pointcloud]`). |
+| `write_labeled_point_cloud(url, input_file, output_file)` | Write a local copy of a LiDAR layer's LAS/LAZ/COPC file with the saved labels and instance ids applied, streaming files larger than memory (needs `geolibre[pointcloud]`). |
+| `set_point_cloud_classes(classes)` | Define the annotator's custom classes, e.g. `[{"code": 64, "name": "Car", "color": "#e11d48"}]` (codes 19-255); the LiDAR layer draws them in their colour and names them in its legend. |
 | `add_3d_tiles(url=None, name=, ion_asset_id=, altitude_offset=, request_headers=, **style)` | Add a 3D Tiles `tileset.json` URL, or a Cesium Ion tileset by asset id (3D globe only). |
 | `add_cesium_ion(asset_id, name=, kind="3d-tiles", altitude_offset=, **style)` | Add a Cesium Ion asset by id: a 3D Tiles tileset or (`kind="imagery"`) an imagery layer. Renders on the 3D globe, with the app's Ion token. |
 | `add_czml(url=None, name=, data=, source_path=, **style)` | Add a CZML (Cesium Language) dynamic 3D scene by URL or inline packets: orbits, vehicle tracks, moving models. Renders on the 3D globe, which follows the document's clock. |
@@ -308,6 +317,7 @@ m.on_layer_change(lambda e: print("layers", e["layerIds"]))
 | `add_video(urls, coordinates, name=, **style)` | Add a georeferenced video (four `[lng, lat]` corners). |
 | `add_basemap(basemap)` | Set the background basemap. |
 | `split_map(left_layers=None, right_layers=None, orientation=, position=, control_position=)` | Add a swipe (split-map) comparison slider between two layer sets. |
+| `set_map_legend(title=None, position=, group_by_layer=, visible=, collapsed=)` | Show the map legend (Controls → Legend), whose rows come from each visible layer's symbology. One per map; calling it again updates it. |
 | `add_legend(title=None, legend_dict=, labels=, colors=, builtin=, position=, shape=)` | Add a legend from a `{label: color}` dict, parallel `labels`/`colors`, or a `builtin` preset (`"nlcd"`, `"esa_worldcover"`). |
 | `add_colorbar(colormap=, vmin=, vmax=, label=, units=, colors=, orientation=, position=)` | Add a colorbar for a continuous raster, from a named colormap or custom `colors`. |
 | `add_colormap(colormap, vmin=, vmax=, label=, **kwargs)` | Add a colorbar from a named colormap (leafmap-style alias of `add_colorbar`). |
@@ -320,7 +330,14 @@ m.on_layer_change(lambda e: print("layers", e["layerIds"]))
 | `remove_layer(layer_id)` / `clear_layers()` | Remove one layer by id, name, or handle, or remove all layers. |
 | `set_popup(layer, fields=None, click=, hover=, title=, title_expression=, body_expression=, show_feature_id=, tooltip=, merge=False)` | Choose what a click popup shows for a layer, and how each value is formatted. |
 | `set_tooltip(layer, fields=True)` / `clear_popup(layer)` | Turn a hover tooltip on (or off), or drop the popup config and restore the default popup. |
-| `set_identify(layer="all")` | Arm the Identify tool so a click opens the popup: on one layer (id, name, or handle), on every visible layer (`"all"`), or off (`None`). |
+| `set_layer_metadata(layer, merge=False, title=, abstract=, keywords=, license=, attribution=, contact=, lineage=, temporal_extent=, links=)` / `clear_layer_metadata(layer)` | Describe a layer for catalogs (the app's Metadata dialog, its STAC Item export and GeoParquet export metadata). Emails, dates (ISO 8601) and link URLs are validated. `Layer.descriptive_metadata` reads it back. |
+| `set_layer_filter(layer, expression)` | Hide a layer's features that do not match a boolean MapLibre expression, e.g. `[">=", ["get", "pop"], 100000]` (the filter Select by Expression → Filter layer saves). `None` clears it. |
+| `set_labels(layer, field=None, expression=None, enabled=None, **options)` | Label features from a property or a text expression. Options: `placement`, `size`, `color`, `halo_color`, `halo_width`, `min_zoom`, `max_zoom`, `allow_overlap`, `anchor`, `offset_x`, `offset_y`, `rotation`, `max_width`, `transform`, `number_format`, `number_decimals`, `number_locale`, `dedupe`, and the data-defined `size_expression`, `color_expression`, `opacity_expression`, `visibility_expression`, `priority_expression`. Settings left out keep their values. |
+| `set_plugin_state(plugin_id, state=None, position=, activate=True, allow_unknown=False, clear=False)` | Store a plugin's saved project state (the blob it restores on open) for a built-in id in `geolibre.project.PLUGIN_STATE_IDS`, or an external plugin's id with `allow_unknown=True`. `state` must be plain JSON; omit it to change only `position`/`activate`. `clear=True` removes the stored state and leaves activation alone. |
+| `set_story_map(**settings)` | Set the [story map](project-format.md#story-map)'s `title`, `subtitle`, `byline`, `footer`, `theme`, `show_markers`, `marker_color`, `inset`, `inset_position`, `hide_chapter_nav`, `start_slide`, `end_slide`. |
+| `add_story_chapter(title, description=, center=, zoom=, pitch=, bearing=, image=, alignment=, hidden=, map_animation=, rotate_animation=, on_enter=, on_exit=, index=)` | Add a story chapter; camera values left out come from the saved view. `on_enter`/`on_exit` fade layers: `[{"layer": "Cities", "opacity": 1, "duration": 800}]`. |
+| `move_story_chapter(chapter, index)` / `remove_story_chapter(chapter)` | Reorder or drop a chapter by id, title, or 0-based index. |
+| `set_identify(layer="all")` | Arm the Identify tool so a click opens the popup: on one layer (id, name, or handle), on a list of layers, on every visible layer (`"all"`), or off (`None`). |
 | `show_control(name, visible=True)` / `hide_control(name)` | Show or hide a toolbar panel (`bookmark`, `search`, `measure`, `minimap`, `print`) or a built-in map control (`navigation`, `fullscreen`, `compass`, `geolocate`, `globe`, `scale`, `attribution`, `logo`). |
 | `set_projection(projection)` / `projection` | Draw the map as a `"globe"` (the default) or flat `"mercator"` map; saved in the project. |
 | `to_project(keep_credentials=False)` | Return the current project as a dict, credentials redacted unless `keep_credentials=True`. |
@@ -391,12 +408,13 @@ m.clear_popup("Sites")                                 # back to the default
 Popups open only while the Identify tool is armed, which in the app is the
 Identify button on a layer or the "Identify visible layers" button in the Layers
 panel header. `set_identify` arms it from Python, and can run before the map is
-displayed. Identify covers one layer or every visible layer at a time, and hover
-tooltips pause while it is armed:
+displayed. Identify covers one layer, a list of layers, or every visible layer,
+and hover tooltips pause while it is armed:
 
 ```python
 m.set_identify()                 # every visible layer
 m.set_identify("Sites")          # one layer
+m.set_identify(["Sites", "Roads"])  # only these layers
 m.set_identify(None)             # off
 
 m.show_control("bookmark")       # open the Bookmarks panel
@@ -405,7 +423,10 @@ m.hide_control("globe")          # hide the globe/flat toggle button
 m.set_projection("mercator")     # draw a flat map instead of a globe
 ```
 
-Identify and the controls are not saved in the project. `set_projection` is.
+`save_project`, `to_project` and `to_html` save the Identify target and the
+controls in the project's `interaction` block, so the saved file or HTML page
+opens the same way, and `load_project` reads them back. `set_projection` is
+saved as a project preference.
 
 `popup=` also accepts shorter forms: a single property name (`popup="name"`), a
 list of names (`popup=["name", "pop"]`), a list of field mappings, or `False` to

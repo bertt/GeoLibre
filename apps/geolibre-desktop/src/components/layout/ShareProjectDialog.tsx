@@ -67,6 +67,7 @@ import { openSettingsSection } from "./SettingsDialog";
 import {
   fetchMyOrganizations,
   fetchMyGroups,
+  canOwnOrganizationProjects,
   isPublicSharingBlocked,
   publicSharingRestriction,
   type ShareOrganization,
@@ -293,7 +294,9 @@ export function ShareProjectDialog({
   const [error, setError] = useState<string | null>(null);
   const [errorCode, setErrorCode] = useState<ShareUploadErrorCode | null>(null);
   const [result, setResult] = useState<ShareUploadResult | null>(null);
-  const [copied, setCopied] = useState(false);
+  // Which copy button last succeeded: "result" for the post-create view, else a
+  // share id. One slot so only the clicked button shows the checkmark.
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [redactedCount, setRedactedCount] = useState(0);
   const [readiness, setReadiness] = useState<ShareReadinessReport | null>(null);
   const [readinessState, setReadinessState] = useState<"idle" | "checking" | "failed">("idle");
@@ -333,8 +336,11 @@ export function ShareProjectDialog({
   const remoteProblems = readiness?.problems.filter(isRemoteRow) ?? [];
   const remoteItemCount = readiness?.items.filter(isRemoteRow).length ?? 0;
 
+  // Viewers cannot own organization projects (the server answers 403), so the
+  // owner picker offers only memberships that can.
+  const ownerOrganizations = organizations.filter(canOwnOrganizationProjects);
   const selectedOrganization =
-    organizations.find((organization) => organization.id === selectedOrgId) ?? null;
+    ownerOrganizations.find((organization) => organization.id === selectedOrgId) ?? null;
   const publicRestriction = publicSharingRestriction(selectedOrganization);
   const publicBlocked = isPublicSharingBlocked(visibility, selectedOrganization);
   const organizationRequired = visibility === "organization" && !selectedOrganization;
@@ -409,7 +415,7 @@ export function ShareProjectDialog({
       setError(null);
       setErrorCode(null);
       setResult(null);
-      setCopied(false);
+      setCopiedKey(null);
       setRedactedCount(0);
       setOauthError(null);
       setTab("create");
@@ -656,7 +662,7 @@ export function ShareProjectDialog({
     openSettingsSection("environment", { focus: "shareToken" });
   };
 
-  const handleCopy = (url?: string) => {
+  const handleCopy = (key: string, url?: string) => {
     const targetUrl = url || result?.projectUrl;
     if (!targetUrl) return;
     // Only show the "copied" checkmark if the write actually succeeds; the
@@ -668,8 +674,8 @@ export function ShareProjectDialog({
         if (copyTimeoutRef.current !== null) {
           window.clearTimeout(copyTimeoutRef.current);
         }
-        setCopied(true);
-        copyTimeoutRef.current = window.setTimeout(() => setCopied(false), 2000);
+        setCopiedKey(key);
+        copyTimeoutRef.current = window.setTimeout(() => setCopiedKey(null), 2000);
       })
       .catch(() => {
         // Clipboard unavailable; leave the icon unchanged.
@@ -801,9 +807,13 @@ export function ShareProjectDialog({
                 type="button"
                 variant="secondary"
                 aria-label={t("share.copyLink")}
-                onClick={() => handleCopy()}
+                onClick={() => handleCopy("result")}
               >
-                {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                {copiedKey === "result" ? (
+                  <Check className="h-3.5 w-3.5" />
+                ) : (
+                  <Copy className="h-3.5 w-3.5" />
+                )}
               </Button>
             </div>
             <div className="flex justify-end gap-2">
@@ -885,7 +895,7 @@ export function ShareProjectDialog({
                         {t("share.visibilityPublic")}
                       </option>
                       <option value="private">{t("share.visibilityPrivate")}</option>
-                      <option value="organization" disabled={organizations.length === 0}>
+                      <option value="organization" disabled={ownerOrganizations.length === 0}>
                         {t("share.visibilityOrganization")}
                       </option>
                     </Select>
@@ -896,6 +906,11 @@ export function ShareProjectDialog({
                             ? "share.publicPublisherRequired"
                             : "share.publicDisabledByOrgPolicy",
                         )}
+                      </p>
+                    )}
+                    {!orgLoading && organizations.length > 0 && ownerOrganizations.length === 0 && (
+                      <p className="text-xs text-muted-foreground">
+                        {t("share.organizationViewerOnly")}
                       </p>
                     )}
                   </div>
@@ -946,7 +961,7 @@ export function ShareProjectDialog({
                   </div>
                 </div>
 
-                {organizations.length > 0 || orgLoading ? (
+                {ownerOrganizations.length > 0 || orgLoading ? (
                   <div className="space-y-1.5">
                     <Label htmlFor="share-organization">{t("share.owner")}</Label>
                     <Select
@@ -954,7 +969,7 @@ export function ShareProjectDialog({
                       value={selectedOrgId || ""}
                       onChange={(event) => {
                         const organization =
-                          organizations.find((item) => item.id === event.target.value) ?? null;
+                          ownerOrganizations.find((item) => item.id === event.target.value) ?? null;
                         setSelectedOrgId(organization?.id ?? null);
                         setVisibility(
                           organization
@@ -967,7 +982,7 @@ export function ShareProjectDialog({
                       disabled={status === "uploading" || orgLoading}
                     >
                       <option value="">{t("share.personalAccount")}</option>
-                      {organizations.map((org) => (
+                      {ownerOrganizations.map((org) => (
                         <option key={org.id} value={org.id}>
                           {org.name} ({org.slug})
                         </option>
@@ -1224,9 +1239,23 @@ export function ShareProjectDialog({
                             size="sm"
                             aria-label={t("share.copyLink")}
                             title={t("share.copyLink")}
-                            onClick={() => handleCopy(s.projectUrl)}
+                            onClick={() => handleCopy(s.id, s.projectUrl)}
                           >
-                            <Copy className="h-3.5 w-3.5" />
+                            {copiedKey === s.id ? (
+                              <Check className="h-3.5 w-3.5" />
+                            ) : (
+                              <Copy className="h-3.5 w-3.5" />
+                            )}
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="secondary"
+                            size="sm"
+                            aria-label={t("share.open")}
+                            title={t("share.open")}
+                            onClick={() => void openExternalLink(s.projectUrl)}
+                          >
+                            <ExternalLink className="h-3.5 w-3.5" />
                           </Button>
                           <Button
                             type="button"

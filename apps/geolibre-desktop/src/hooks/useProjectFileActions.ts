@@ -5,7 +5,10 @@ import {
   projectFromStore,
   redactProjectCredentials,
   excludeHiddenFieldsFromProject,
+  extractLayerStyleEntries,
+  serializeLayerStylesFile,
   serializeProject,
+  splitProjectCredentials,
   useAppStore,
   type GeoLibreLayer,
   type GeoLibreProject,
@@ -18,7 +21,11 @@ import {
 } from "@geolibre/plugins";
 import type { FeatureCollection } from "geojson";
 import { type FormEvent, useCallback, useLayoutEffect, useRef, useState } from "react";
-import { embedEditedGeometry, hasEditedGeometry } from "../lib/edited-geometry-save";
+import {
+  discardEditedWfsGeometry,
+  embedEditedGeometry,
+  hasEditedGeometry,
+} from "../lib/edited-geometry-save";
 import { useTranslation } from "react-i18next";
 import { createAppAPI, getPluginManager } from "./usePlugins";
 import { pluginManifestUrlsForIds } from "../lib/external-plugins";
@@ -37,10 +44,13 @@ import {
   saveProjectFileToPath,
   saveStartupProjectSnapshot,
   saveTextFileWithFallback,
+  type OpenedProjectFile,
 } from "../lib/tauri-io";
 import { useDesktopSettingsStore } from "./useDesktopSettings";
-import { buildProjectHtml } from "../lib/html-export";
-import { ensureHtmlFileName, ensureProjectFileName } from "../lib/file-names";
+import { buildProjectHtml, viewerChromeParams } from "../lib/html-export";
+import { isLayersPanelCollapsed } from "../lib/layer-panel-collapse";
+import { ensureHtmlFileName, ensureJsonFileName, ensureProjectFileName } from "../lib/file-names";
+import { pickLayerStylesFile } from "../lib/layer-style-files";
 import { mergeStringLists } from "../lib/string-lists";
 import { fetchProjectFromUrl } from "../lib/project-url";
 import { getShareFetch } from "../lib/share-fetch";
@@ -81,6 +91,22 @@ import { importArcgisProject, type ArcgisProjectImportWarning } from "../lib/arc
 import type { MapControllerRef } from "../components/layout/toolbar/constants";
 import { IS_MAS_BUILD } from "../lib/build-flags";
 import { resolveDroppedProjectIfCurrent } from "../lib/dropped-project";
+import { useWindowCloseGuard } from "./useWindowCloseGuard";
+import {
+  projectCredentialRollback,
+  projectCredentialsInKeychain,
+  rememberProjectCredentials,
+} from "../lib/project-credentials";
+
+/** Keychain changes a save made early, undone unless the project is written. */
+interface SaveCredentials {
+  rollback: Record<string, string> | null;
+  written: boolean;
+  /** Every credential reached the keychain and was left out of the file. */
+  stripped: boolean;
+  /** The user chose to keep the remaining credentials in the file. */
+  keptPlaintext: boolean;
+}
 
 /** A pending "strip credentials before saving?" prompt. */
 export interface CredentialStripPrompt {
@@ -284,6 +310,16 @@ async function addImportedProjectRaster(
   }
 }
 
+/** What Import Layer Styles did, shown in its summary dialog. */
+export interface LayerStyleImportResult {
+  /** The imported file's name. */
+  fileName: string;
+  /** Names of the layers that were restyled. */
+  restyled: string[];
+  /** Layer names in the file that no layer in the project took. */
+  unused: string[];
+}
+
 /**
  * Bundles every project file action (open from file/URL/recent, save, save as)
  * along with the related dialog state (Open-from-URL, env-var strip prompt, and
@@ -314,6 +350,8 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
   const [arcgisImportWarnings, setArcgisImportWarnings] = useState<
     ArcgisProjectImportWarning[] | null
   >(null);
+  const [layerStyleImportResult, setLayerStyleImportResult] =
+    useState<LayerStyleImportResult | null>(null);
   const [projectUrlDialogOpen, setProjectUrlDialogOpen] = useState(false);
   const [projectUrl, setProjectUrl] = useState("");
   const [projectUrlError, setProjectUrlError] = useState<string | null>(null);
@@ -843,6 +881,12 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       asCopy?: boolean;
       oauthSessionRevision?: number;
       remoteProject?: RemoteSharedProjectTarget;
+      /**
+       * Lets the caller cancel the open (e.g. the New Project dialog closing
+       * mid-download): an abort before the project loads leaves the current
+       * project untouched.
+       */
+      signal?: AbortSignal;
     } = {},
   ): Promise<void> => {
     const normalizedUrl = normalizeProjectUrl(url);
@@ -853,6 +897,8 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
     shareUrlAbortRef.current?.abort();
     const controller = new AbortController();
     shareUrlAbortRef.current = controller;
+    if (options.signal?.aborted) controller.abort();
+    options.signal?.addEventListener("abort", () => controller.abort(), { once: true });
 
     try {
       let project: Awaited<ReturnType<typeof resolveProjectXyzLayers>>;
@@ -906,7 +952,44 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
   // set the shared `actionError` itself, so each caller can route the failure to
   // its own surface (the toolbar's modal vs. the Browser panel's inline banner)
   // now that a single instance is shared across both.
+  // The browser cannot reopen a file by the name it was saved under, so a local
+  // recent entry on the web asks the user to pick the file again (GeoLibre#2921).
+  const reopenRecentWithPicker = async (signal: AbortSignal): Promise<string | null> => {
+    let result: OpenedProjectFile | null;
+    try {
+      result = await openProjectFile();
+    } catch (error) {
+      if (signal.aborted) return null;
+      console.error("Failed to open recent project", error);
+      return error instanceof Error ? error.message : t("toolbar.error.couldNotOpenRecentProject");
+    }
+    if (!result || signal.aborted) return null;
+    try {
+      const project = await resolveProjectXyzLayers(result.project, signal);
+      if (signal.aborted) return null;
+      loadProject(project, result.path);
+      return null;
+    } catch (error) {
+      if (signal.aborted) return null;
+      console.error("Failed to load recent project", error);
+      return error instanceof Error ? error.message : t("toolbar.error.couldNotLoadRecentProject");
+    }
+  };
+
   const handleOpenRecent = async (path: string): Promise<string | null> => {
+    if (!isTauri() && !isHttpUrl(path)) {
+      // Cancel any previous open; stale picker results must not replace a newer
+      // project selection.
+      recentAbortRef.current?.abort();
+      const controller = new AbortController();
+      recentAbortRef.current = controller;
+      // Called synchronously: Safari only opens a file picker inside the user gesture.
+      return reopenRecentWithPicker(controller.signal).finally(() => {
+        if (recentAbortRef.current === controller) {
+          recentAbortRef.current = null;
+        }
+      });
+    }
     // Cancel any previous in-flight open so rapid clicks cannot race and let a
     // stale fetch win by resolving last.
     recentAbortRef.current?.abort();
@@ -1007,6 +1090,7 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       primaryRenderer: state.primaryRenderer,
       styleLibrary: state.projectStyleLibrary,
       comments: state.comments,
+      interaction: state.projectInteraction,
       metadata: state.metadata,
     });
     // The serialized text is deliberately not returned: every caller
@@ -1240,15 +1324,25 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       };
     }
 
-    // "noembed": on the web this saves without the local data (those layers are
-    // lost on reopen). On desktop it saves file references — but only for layers
-    // that actually have a re-readable path; the rest (e.g. an Add Vector Layer
-    // file restored from an embedded copy on a machine without the original) are
-    // embedded as a fallback, since referencing them would save no data at all.
-    if (!isTauri()) return {};
+    // "noembed": on the web this saves without local data; on desktop it saves
+    // file references where available. Edited WFS layers cannot be represented
+    // by a file reference, so this choice intentionally saves the live service
+    // URL and drops the locally edited collection.
     let changed = false;
+    if (!isTauri()) {
+      const layers = useAppStore.getState().layers.map((layer) => {
+        const savedLayer = discardEditedWfsGeometry(layer);
+        if (savedLayer !== layer) changed = true;
+        return savedLayer;
+      });
+      return changed ? { layers } : {};
+    }
     const layers = useAppStore.getState().layers.map((layer) => {
-      if (hasEditedGeometry(layer) && !isReloadableLocalFileLayer(layer)) return layer;
+      if (hasEditedGeometry(layer) && !isReloadableLocalFileLayer(layer)) {
+        const savedLayer = discardEditedWfsGeometry(layer);
+        if (savedLayer !== layer) changed = true;
+        return savedLayer;
+      }
       // Plain GeoJSON with an absolute path → reference (drop the embedded copy).
       if (isReloadableLocalFileLayer(layer)) {
         changed = true;
@@ -1307,8 +1401,135 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
 
   const cancelSaveNamePrompt = () => settleSaveNamePrompt(saveNamePrompt, null);
 
+  // Saving back to an editable shared project writes the version every group
+  // member opens, so it is built like Share: local vector data is embedded (never
+  // file references) and credentials are redacted. The local-save prompts do not
+  // apply, since neither choice can be honoured on the server.
+  const saveBackToShare = async (
+    remoteProject: RemoteSharedProjectTarget & { projectGeneration: number },
+    saveProjectGeneration: number,
+  ): Promise<boolean> => {
+    // Unembedded snapshot, compared after the upload to tell whether the user
+    // changed the project while the save was in flight.
+    const startContent = serializeForSave(
+      excludeHiddenFieldsFromProject(buildCurrentProject().project),
+    );
+    if (startContent === null) return false;
+    try {
+      const { project } = await buildEmbeddedProject();
+      if (useAppStore.getState().projectGeneration !== saveProjectGeneration) return false;
+      const contentToSave = serializeForSave(
+        redactProjectCredentials(excludeHiddenFieldsFromProject(project)).project,
+      );
+      if (contentToSave === null) return false;
+      // Re-resolved per save: an OAuth access token captured at open time
+      // may have expired; `remoteProject.token` is the personal-token fallback.
+      const token = await resolveShareRequestToken(remoteProject.token, remoteProject.baseUrl);
+      if (
+        remoteProject !== remoteProjectRef.current ||
+        (remoteProject.oauthSessionRevision !== undefined &&
+          remoteProject.oauthSessionRevision !== useShareOAuthStore.getState().sessionRevision)
+      )
+        return false;
+      const updated = await updateSharedProjectContent({
+        token,
+        projectId: remoteProject.id,
+        content: contentToSave,
+        expectedVersion: remoteProject.versionCount,
+        baseUrl: remoteProject.baseUrl,
+      });
+      if (
+        useAppStore.getState().projectGeneration !== saveProjectGeneration ||
+        remoteProject !== remoteProjectRef.current ||
+        (remoteProject.oauthSessionRevision !== undefined &&
+          remoteProject.oauthSessionRevision !== useShareOAuthStore.getState().sessionRevision)
+      )
+        return false;
+      const updatedRemoteProject = {
+        ...remoteProject,
+        versionCount: updated.versionCount,
+      };
+      remoteProjectRef.current = updatedRemoteProject;
+
+      // The upload already succeeded, so a failure here must not report an
+      // error; it only leaves the project marked unsaved.
+      let liveContent: string | null = null;
+      try {
+        liveContent = serializeProject(
+          excludeHiddenFieldsFromProject(buildCurrentProject().project),
+        );
+      } catch (error) {
+        console.error("Failed to compare the saved shared project", error);
+      }
+      if (liveContent && sharedProjectContentMatches(startContent, liveContent)) {
+        markSaved();
+        recordExplicitProjectSave();
+      }
+      setRemoteSaveWarning(updated.warning ? updatedRemoteProject : null);
+      return true;
+    } catch (error) {
+      console.error("Failed to update shared project", error);
+      setActionError(
+        error instanceof ShareOAuthError
+          ? t(shareOAuthErrorKey(error.code))
+          : error instanceof ShareUploadError && error.code === "unauthorized"
+            ? t(
+                supportsShareOAuth()
+                  ? "gallery.errorUnauthorizedOAuth"
+                  : "gallery.errorUnauthorized",
+                { shareHost: shareHostLabel() },
+              )
+            : error instanceof Error
+              ? error.message
+              : t("toolbar.error.couldNotSaveProject"),
+      );
+      return false;
+    }
+  };
+
+  // Saving moves credentials to the device-wide keychain before the file is
+  // written, so the prompt below has nothing to ask about. A save that never
+  // writes (cancelled prompt or picker, failed write, a project switched in
+  // meanwhile) puts the previous values back, so it cannot replace the value
+  // other projects on this device use.
   const runSaveProject = async (options?: { saveAs?: boolean }): Promise<boolean> => {
+    const credentials: SaveCredentials = {
+      rollback: null,
+      written: false,
+      stripped: false,
+      keptPlaintext: false,
+    };
+    try {
+      return await saveProjectWithCredentials(options, credentials);
+    } finally {
+      // Awaited so saveProject's overlapping-save guard stays held until the
+      // shared values are back, and a later save starts from them.
+      if (
+        credentials.rollback &&
+        (!credentials.written || (!credentials.stripped && credentials.keptPlaintext)) &&
+        !(await rememberProjectCredentials(credentials.rollback))
+      ) {
+        console.error("[GeoLibre] Could not restore stored project credentials", {
+          accounts: Object.keys(credentials.rollback),
+        });
+        setActionError(t("toolbar.error.credentialRollbackFailed"));
+      }
+    }
+  };
+
+  const saveProjectWithCredentials = async (
+    options: { saveAs?: boolean } | undefined,
+    credentials: SaveCredentials,
+  ): Promise<boolean> => {
     const saveProjectGeneration = useAppStore.getState().projectGeneration;
+    const remoteProject = remoteProjectRef.current;
+    if (
+      !options?.saveAs &&
+      remoteProject?.canEdit &&
+      remoteProject.projectGeneration === saveProjectGeneration
+    ) {
+      return saveBackToShare(remoteProject, saveProjectGeneration);
+    }
     // Offer to embed local vector data (or, on desktop, save file references)
     // first, so the serialized content below reflects the user's choice.
     const layersForSave = await resolveLayersForSave();
@@ -1322,11 +1543,26 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       undefined,
       layersForSave.layers,
     );
-    // Credentials are serialized in plain text for a local project that needs
-    // them. Make keeping them an explicit choice and use the same central
-    // redaction pass as every external egress.
+    // Desktop: geocoding keys and uniquely named secret environment variables
+    // move to the OS keychain. Ambiguous rows and
+    // failed keychain writes fall through to the keep/strip prompt below, so
+    // the user neither writes plaintext silently nor loses the value.
+    let projectForSave = project;
+    if (projectCredentialsInKeychain()) {
+      const split = splitProjectCredentials(project);
+      const rollback = projectCredentialRollback(split.secrets);
+      if (Object.keys(rollback).length > 0) credentials.rollback = rollback;
+      if (await rememberProjectCredentials(split.secrets)) {
+        projectForSave = split.project;
+        credentials.stripped = true;
+      }
+      if (useAppStore.getState().projectGeneration !== saveProjectGeneration) return false;
+    }
+    // Remaining credentials are serialized in plain text for a local project
+    // that needs them. Make keeping them an explicit choice and use the same
+    // central redaction pass as every external egress.
     let contentToSave: string | null;
-    const projectToEgress = excludeHiddenFieldsFromProject(project);
+    const projectToEgress = excludeHiddenFieldsFromProject(projectForSave);
     const redacted = redactProjectCredentials(projectToEgress);
     if (redacted.redactedPaths.length > 0) {
       const remembered = saveChoicesForProject(saveChoicesRef.current, saveProjectGeneration);
@@ -1339,6 +1575,9 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
         rememberedCredentialChoice ??
         (await askStripCredentials(redacted.redactedCount, saveProjectGeneration));
       if (choice === "cancel") return false;
+      // Keep writes the plaintext into the file, so a partial keychain write
+      // is redundant and is undone. Strip leaves the keychain as the only copy.
+      credentials.keptPlaintext = choice === "keep";
       if (useAppStore.getState().projectGeneration !== saveProjectGeneration) return false;
       saveChoicesRef.current = rememberProjectSaveChoices(
         saveChoicesRef.current,
@@ -1358,69 +1597,7 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       contentToSave = serializeForSave(projectToEgress);
     }
     if (contentToSave === null) return false;
-    const remoteProject = remoteProjectRef.current;
-    if (
-      !options?.saveAs &&
-      remoteProject?.canEdit &&
-      remoteProject.projectGeneration === saveProjectGeneration
-    ) {
-      try {
-        // Re-resolved per save: an OAuth access token captured at open time
-        // may have expired; `remoteProject.token` is the personal-token fallback.
-        const token = await resolveShareRequestToken(remoteProject.token, remoteProject.baseUrl);
-        if (
-          remoteProject !== remoteProjectRef.current ||
-          (remoteProject.oauthSessionRevision !== undefined &&
-            remoteProject.oauthSessionRevision !== useShareOAuthStore.getState().sessionRevision)
-        )
-          return false;
-        const updated = await updateSharedProjectContent({
-          token,
-          projectId: remoteProject.id,
-          content: contentToSave,
-          expectedVersion: remoteProject.versionCount,
-          baseUrl: remoteProject.baseUrl,
-        });
-        if (
-          useAppStore.getState().projectGeneration !== saveProjectGeneration ||
-          remoteProject !== remoteProjectRef.current ||
-          (remoteProject.oauthSessionRevision !== undefined &&
-            remoteProject.oauthSessionRevision !== useShareOAuthStore.getState().sessionRevision)
-        )
-          return false;
-        const updatedRemoteProject = {
-          ...remoteProject,
-          versionCount: updated.versionCount,
-        };
-        remoteProjectRef.current = updatedRemoteProject;
 
-        const liveProject = excludeHiddenFieldsFromProject(buildCurrentProject().project);
-        const liveContent = serializeForSave(liveProject);
-        if (liveContent && sharedProjectContentMatches(updated.savedContent, liveContent)) {
-          markSaved();
-          recordExplicitProjectSave();
-        }
-        setRemoteSaveWarning(updated.warning ? updatedRemoteProject : null);
-        return true;
-      } catch (error) {
-        console.error("Failed to update shared project", error);
-        setActionError(
-          error instanceof ShareOAuthError
-            ? t(shareOAuthErrorKey(error.code))
-            : error instanceof ShareUploadError && error.code === "unauthorized"
-              ? t(
-                  supportsShareOAuth()
-                    ? "gallery.errorUnauthorizedOAuth"
-                    : "gallery.errorUnauthorized",
-                  { shareHost: shareHostLabel() },
-                )
-              : error instanceof Error
-                ? error.message
-                : t("toolbar.error.couldNotSaveProject"),
-        );
-        return false;
-      }
-    }
     // Projects opened from a URL have no writable path, so both Save and
     // Save As fall back to the save dialog for them.
     const existingLocalPath = projectPath && !isHttpUrl(projectPath) ? projectPath : null;
@@ -1463,6 +1640,7 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       return false;
     }
     if (!path) return false;
+    credentials.written = true;
     // A native picker can remain open while another project arrives through an
     // external action. The old project may have been written successfully, but
     // never attach its path or saved state to the replacement project.
@@ -1508,6 +1686,8 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
 
   const handleSave = () => saveProject();
   const handleSaveAs = () => saveProject({ saveAs: true });
+  // The desktop window's title-bar X asks before dropping unsaved work.
+  const windowCloseGuard = useWindowCloseGuard(handleSave);
 
   // Export the current project as a standalone interactive HTML page (#821).
   // Shares saveProject's guard so a double-click can't open two save dialogs.
@@ -1559,6 +1739,12 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       const html = buildProjectHtml({
         project,
         title: defaultProjectName,
+        // Open the export with this app's chrome: its layout flags, theme,
+        // and a collapsed Layers panel (#2764).
+        viewerParams: viewerChromeParams(window.location.search, {
+          themeMode: document.documentElement.classList.contains("dark") ? "dark" : "light",
+          layersCollapsed: isLayersPanelCollapsed(),
+        }),
       });
       // Returns null when the user cancels the save dialog; report that as a
       // no-op rather than a successful export.
@@ -1582,6 +1768,106 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       return false;
     } finally {
       isSavingRef.current = false;
+    }
+  };
+
+  // Write every layer's style to one JSON file, keyed by layer name, for
+  // Import Layer Styles or the Startup setting to apply to another project.
+  const handleExportLayerStyles = async (): Promise<boolean> => {
+    if (isSavingRef.current) return false;
+    const entries = extractLayerStyleEntries(useAppStore.getState().layers);
+    if (entries.length === 0) {
+      setActionError(t("toolbar.error.noLayerStylesToExport"));
+      return false;
+    }
+    isSavingRef.current = true;
+    try {
+      const exportProjectGeneration = useAppStore.getState().projectGeneration;
+      const projectName = useAppStore.getState().projectName.trim() || DEFAULT_PROJECT_NAME;
+      const slug = `${
+        projectName
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "") || "geolibre-map"
+      }-styles`;
+      let defaultName = `${slug}.json`;
+      // Same name prompt as Export HTML, for browsers that would otherwise
+      // download straight away under the generated name (issue #991).
+      if (browserSaveFallsBackToDownload()) {
+        const chosen = await askSaveName(
+          defaultName,
+          {
+            title: t("toolbar.item.exportLayerStylesAsTitle"),
+            description: t("toolbar.item.exportLayerStylesAsDesc"),
+            label: t("toolbar.item.exportLayerStylesFileName"),
+            placeholder: t("toolbar.item.exportLayerStylesFileNamePlaceholder"),
+          },
+          exportProjectGeneration,
+        );
+        if (chosen === null) return false;
+        defaultName = ensureJsonFileName(chosen, slug);
+      }
+      // Don't write a project that is no longer open. Checked before the write,
+      // not after it: the save picker writes as it closes, so a later check
+      // would report a failure for a file already on disk. A switch while the
+      // native picker itself is open still saves the styles as they were when
+      // the user chose Export, which is what they asked for.
+      if (useAppStore.getState().projectGeneration !== exportProjectGeneration) return false;
+      const savedPath = await saveTextFileWithFallback(serializeLayerStylesFile(entries), {
+        defaultName,
+        filters: [{ name: t("toolbar.item.layerStylesFile"), extensions: ["json"] }],
+        browserTypes: [
+          {
+            description: t("toolbar.item.layerStylesFile"),
+            accept: { "application/json": [".json"] },
+          },
+        ],
+        mimeType: "application/json",
+      });
+      return savedPath !== null;
+    } catch (error) {
+      setActionError(
+        error instanceof Error ? error.message : t("toolbar.error.couldNotExportLayerStyles"),
+      );
+      return false;
+    } finally {
+      isSavingRef.current = false;
+    }
+  };
+
+  // Restyle the current project's layers from a layer styles file, matching
+  // each entry to a layer by name, then report what matched.
+  const handleImportLayerStyles = async () => {
+    try {
+      const importProjectGeneration = useAppStore.getState().projectGeneration;
+      const picked = await pickLayerStylesFile();
+      if (!picked) return;
+      // The styles were picked for the project open when the import started.
+      if (useAppStore.getState().projectGeneration !== importProjectGeneration) return;
+      const applied = useAppStore.getState().applyLayerStyleEntries(picked.entries);
+      const appliedIds = new Set(applied.map((match) => match.layerId));
+      const usedEntries = new Set(applied.map((match) => match.entryIndex));
+      const layers = useAppStore.getState().layers;
+      const restyled = layers.filter((layer) => appliedIds.has(layer.id));
+      // Report the entries no layer took, including a same-named entry of the
+      // other style family and a duplicate shadowed by an earlier one.
+      const unused = [
+        ...new Set(
+          picked.entries
+            .filter((_, index) => !usedEntries.has(index))
+            .map((entry) => entry.layerName),
+        ),
+      ];
+      setLayerStyleImportResult({
+        fileName: picked.name,
+        restyled: restyled.map((layer) => layer.name),
+        unused,
+      });
+    } catch (error) {
+      console.error("Failed to import layer styles", error);
+      setActionError(
+        error instanceof Error ? error.message : t("toolbar.error.couldNotImportLayerStyles"),
+      );
     }
   };
 
@@ -1611,6 +1897,7 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
     droppedProjectPrompt,
     droppedProjectSaving,
     resolveDroppedProjectPrompt,
+    ...windowCloseGuard,
     qgisImportWarnings,
     setQgisImportWarnings,
     arcgisImportWarnings,
@@ -1651,6 +1938,10 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
     handleSave,
     handleSaveAs,
     handleExportHtml,
+    handleExportLayerStyles,
+    handleImportLayerStyles,
+    layerStyleImportResult,
+    setLayerStyleImportResult,
   };
 }
 

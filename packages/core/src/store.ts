@@ -37,7 +37,14 @@ export type {
   StatisticsToolKind,
   VectorToolKind,
 } from "./store/ui-slice";
-export { type GpsStatusFix, IDENTIFY_ALL_LAYERS_ID } from "./store/session-slice";
+export {
+  type GpsStatusFix,
+  IDENTIFY_ALL_LAYERS_ID,
+  type IdentifyState,
+  identifyAllIncludes,
+  identifyStateWithoutLayers,
+  resolveIdentifyTarget,
+} from "./store/session-slice";
 export { DEFAULT_COLLABORATION_STATE } from "./store/collaboration-slice";
 export { projectPathLabel } from "./store/project-slice";
 export {
@@ -85,6 +92,17 @@ useAppStore.subscribe((state) => {
   lastEllipsoidId = id;
   setActiveEllipsoidId(id);
 });
+
+/**
+ * Whether the map should fit to data the user just added, per the project's
+ * Map Preferences. Add-data paths consult this before an automatic fit; an
+ * explicit "Zoom to layer" request ignores it.
+ *
+ * @returns `true` unless the user turned off zooming to new layers.
+ */
+export function shouldZoomToNewLayers(): boolean {
+  return useAppStore.getState().preferences.map.zoomToNewLayers !== false;
+}
 
 /**
  * React hook for consuming application capability state for a specific privilege.

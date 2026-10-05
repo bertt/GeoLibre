@@ -1,5 +1,6 @@
 import { useAppStore, FEET_PER_METER, METERS_PER_MILE } from "@geolibre/core";
-import type { MapEngine } from "@geolibre/map";
+import { rendererCapabilities, type MapEngine } from "@geolibre/map";
+import { isGeoEditorUsingRightClick } from "@geolibre/plugins";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -22,10 +23,12 @@ import {
   MapPin,
   Route,
   Sparkles,
+  Spline,
   ZoomIn,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
+import { ContextMenuGestureTracker, type ContextMenuRequest } from "../../lib/context-menu-gesture";
 import { googleEarthUrl, googleMapsUrl } from "../../lib/external-map-links";
 import { openExternalLink } from "../../lib/open-external";
 import {
@@ -38,6 +41,7 @@ import {
   beginQuickAnalysisRun,
   type QuickBufferPreset,
 } from "../../lib/quick-analysis";
+import { useLineOfSightTool } from "../../lib/line-of-sight-store";
 import { hasRoutingConsent, recordRoutingConsent } from "../../lib/routing-consent";
 import { runViewshed } from "../../lib/run-viewshed";
 import { RoutingConsentDialog } from "./RoutingConsentDialog";
@@ -127,10 +131,9 @@ export function MapContextMenu({
     if (!surface) return;
     const canvas = surface.getCanvas();
 
-    const handleContextMenu = (event: MouseEvent) => {
-      event.preventDefault();
+    const openAt = ({ clientX, clientY }: ContextMenuRequest) => {
       const rect = canvas.getBoundingClientRect();
-      const coordinate = surface.unproject([event.clientX - rect.left, event.clientY - rect.top]);
+      const coordinate = surface.unproject([clientX - rect.left, clientY - rect.top]);
       // Globe renderers can return no coordinate when the pointer is over
       // empty space beyond the planet. In that case there is no point for the
       // menu actions to operate on.
@@ -140,14 +143,55 @@ export function MapContextMenu({
         id: seqRef.current,
         lng: coordinate.lng,
         lat: coordinate.lat,
-        x: event.clientX,
-        y: event.clientY,
+        x: clientX,
+        y: clientY,
       });
       setOpen(true);
     };
+    // A right-button drag turns the camera, so it must not also open the menu
+    // (issue #2721). The tracker defers the menu to the button release and
+    // drops it when the pointer moved. Touch is left alone so a long-press
+    // still opens the menu while the finger is down.
+    const tracker = new ContextMenuGestureTracker(openAt);
 
+    const handlePointerDown = (event: PointerEvent) => {
+      if (event.pointerType === "touch") return;
+      tracker.pointerDown(event);
+    };
+    const handlePointerMove = (event: PointerEvent) => tracker.pointerMove(event);
+    const handlePointerUp = (event: PointerEvent) => tracker.pointerUp(event);
+    const handlePointerCancel = (event: PointerEvent) => tracker.cancel(event.pointerId);
+    const handleBlur = () => tracker.cancel();
+    // The menu key and Shift+F10 open the menu from the keyboard; forget any
+    // just-released right-drag so it cannot swallow that request. Other keys
+    // are ignored so holding Shift during a drag keeps the gesture.
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey)) tracker.cancel();
+    };
+    const handleContextMenu = (event: MouseEvent) => {
+      event.preventDefault();
+      // The geo editor owns right-click while drawing or editing: it removes
+      // the vertex under the cursor or finishes the draw (discussion #2750).
+      if (isGeoEditorUsingRightClick()) return;
+      tracker.contextMenu(event);
+    };
+
+    // Move/up listen on the window in the capture phase: the drag leaves the
+    // canvas, and map engines may capture the pointer or stop propagation.
+    canvas.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("pointermove", handlePointerMove, true);
+    window.addEventListener("pointerup", handlePointerUp, true);
+    window.addEventListener("pointercancel", handlePointerCancel, true);
+    window.addEventListener("blur", handleBlur);
+    window.addEventListener("keydown", handleKeyDown, true);
     canvas.addEventListener("contextmenu", handleContextMenu);
     return () => {
+      canvas.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("pointermove", handlePointerMove, true);
+      window.removeEventListener("pointerup", handlePointerUp, true);
+      window.removeEventListener("pointercancel", handlePointerCancel, true);
+      window.removeEventListener("blur", handleBlur);
+      window.removeEventListener("keydown", handleKeyDown, true);
       canvas.removeEventListener("contextmenu", handleContextMenu);
     };
   }, [mapControllerRef, mapReadyGeneration]);
@@ -295,6 +339,16 @@ export function MapContextMenu({
     },
     [menu, viewshedBusy, t, formatViewshedRadius, mapControllerRef],
   );
+
+  // Line of sight (#2858) draws transient MapLibre style layers, so it is
+  // offered only where the primary map exposes a MapLibre instance.
+  const primaryRenderer = useAppStore((s) => s.primaryRenderer);
+  const lineOfSightAvailable = rendererCapabilities(primaryRenderer).nativeMapInstance;
+  const openLineOfSight = useLineOfSightTool((s) => s.openLineOfSight);
+  const lineOfSightHere = useCallback(() => {
+    if (!menu) return;
+    openLineOfSight({ lng: menu.lng, lat: menu.lat });
+  }, [menu, openLineOfSight]);
 
   const bufferHere = useCallback(
     (preset: QuickBufferPreset) => {
@@ -468,6 +522,12 @@ export function MapContextMenu({
                   })}
                 </DropdownMenuItem>
               ))}
+              {lineOfSightAvailable ? (
+                <DropdownMenuItem onSelect={lineOfSightHere} className="gap-2">
+                  <Spline className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  {t("quickAnalysis.lineOfSightHere")}
+                </DropdownMenuItem>
+              ) : null}
               <DropdownMenuSeparator />
               {/* Escape hatch when the presets aren't what was wanted: the full
                 dialog, preselected on the same tool. */}

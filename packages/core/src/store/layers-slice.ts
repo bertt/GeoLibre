@@ -19,8 +19,11 @@ import {
   type CopiedLayerStyle,
   extractCopiedLayerStyle,
 } from "../layer-style-clipboard";
+import { matchLayerStyleEntry, type LayerStyleFileEntry } from "../layer-style-file";
 import { applyJoinsToLayer, cascadeLayerJoinRefresh } from "../joins";
+import { normalizeLayerDescriptiveMetadata } from "../layer-descriptive-metadata";
 import { scrubPrintLayoutForRemovedLayers } from "../print-layout-config";
+import { identifyStateWithoutLayers } from "./session-slice";
 import {
   DEFAULT_LAYER_STYLE,
   type AddTileLayerOptions,
@@ -28,6 +31,7 @@ import {
   type EditorTrackingConfig,
   type GeoLibreLayer,
   type LayerJoin,
+  type LayerDescriptiveMetadata,
   type LayerPopupConfig,
   type LayerQuickFilter,
   type LayerStyle,
@@ -87,6 +91,22 @@ export interface LayersSlice {
    */
   pasteLayerStyle: (id: string) => boolean;
   /**
+   * Restyle layers from layer styles file entries matched by layer name
+   * (Import Layer Styles, and the Startup setting's auto-apply). Each matched
+   * layer is patched the way {@link pasteLayerStyle} would patch it, all in a
+   * single store update so the import is one undo step.
+   *
+   * @param entries - The parsed style entries.
+   * @param layerIds - Restrict the restyle to these layers; every layer when
+   *   omitted.
+   * @returns Each restyled layer's id with the index of the entry it took, in
+   *   stack order.
+   */
+  applyLayerStyleEntries: (
+    entries: readonly LayerStyleFileEntry[],
+    layerIds?: readonly string[],
+  ) => { layerId: string; entryIndex: number }[];
+  /**
    * Replace a layer's persistent attribute joins and immediately re-derive its
    * joined columns (strip what the previous joins added, apply the new list).
    * Pass an empty array to detach every join and restore the base attributes.
@@ -104,6 +124,13 @@ export interface LayersSlice {
    * `undefined` to restore the default full-property dump.
    */
   setLayerPopup: (id: string, popup: LayerPopupConfig | undefined) => void;
+  /**
+   * Replace the layer's user-authored catalog metadata (title, abstract,
+   * keywords, license, contact, lineage, temporal extent, links). The record
+   * is normalized first; one that cleans to nothing (or `undefined`) removes
+   * the metadata entirely. One call is one undo step.
+   */
+  setLayerDescriptiveMetadata: (id: string, metadata: LayerDescriptiveMetadata | undefined) => void;
   /**
    * Replace the layer's editor tracking configuration (whether creation/edit
    * author and timestamp columns are maintained, and under which names). Pass
@@ -250,7 +277,7 @@ export const createLayersSlice: SliceCreator<LayersSlice> = (set, get) => ({
           : s.selectedLayerId,
       selectedFeatureId: s.selectedLayerId === id ? null : s.selectedFeatureId,
       selectedFeatureIds: s.selectedLayerId === id ? [] : s.selectedFeatureIds,
-      identifyLayerId: s.identifyLayerId === id ? null : s.identifyLayerId,
+      ...identifyStateWithoutLayers(s, new Set([id])),
       ui: {
         ...s.ui,
         selectByExpressionLayerId:
@@ -301,6 +328,8 @@ export const createLayersSlice: SliceCreator<LayersSlice> = (set, get) => ({
 
   setLayerAttributeForm: (id, attributeForm) => get().updateLayer(id, { attributeForm }),
   setLayerPopup: (id, popup) => get().updateLayer(id, { popup }),
+  setLayerDescriptiveMetadata: (id, metadata) =>
+    get().updateLayer(id, { descriptiveMetadata: normalizeLayerDescriptiveMetadata(metadata) }),
 
   setLayerEditorTracking: (id, editorTracking) => get().updateLayer(id, { editorTracking }),
 
@@ -356,6 +385,23 @@ export const createLayersSlice: SliceCreator<LayersSlice> = (set, get) => ({
     // so the join-cascade branch is a no-op.
     get().updateLayer(id, patch);
     return true;
+  },
+
+  applyLayerStyleEntries: (entries, layerIds) => {
+    if (entries.length === 0) return [];
+    const scope = layerIds ? new Set(layerIds) : null;
+    const applied: { layerId: string; entryIndex: number }[] = [];
+    const layers = get().layers.map((layer) => {
+      if (scope && !scope.has(layer.id)) return layer;
+      const match = matchLayerStyleEntry(layer, entries);
+      if (!match) return layer;
+      applied.push({ layerId: layer.id, entryIndex: match.entryIndex });
+      return { ...layer, ...match.patch };
+    });
+    // A style patch never carries geojson, so unlike updateLayer there is no
+    // join cascade to run.
+    if (applied.length > 0) set({ layers, isDirty: true });
+    return applied;
   },
 
   reorderLayer: (id, direction) =>

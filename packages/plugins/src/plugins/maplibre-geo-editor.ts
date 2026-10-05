@@ -12,7 +12,7 @@ import {
   mapboxLineLayerId,
   mapboxSourceId,
 } from "@geolibre/map/style-layer-ids";
-import type { Feature, FeatureCollection } from "geojson";
+import type { Feature, FeatureCollection, MultiLineString, Position } from "geojson";
 import type * as maplibregl from "maplibre-gl";
 import type { GeoEditor, GeoEditorOptions } from "maplibre-gl-geo-editor";
 import {
@@ -21,9 +21,11 @@ import {
   SKETCHES_SOURCE_KIND,
   applySyncedEditorTracking,
   canEditLayerGeometry,
+  findGeometryEditFeature,
   geometryEditMetadata,
   captureEditedGeometries,
   captureEditedProperties,
+  removeMultiLineStringVertex,
   planGeoEditorOverlayOrder,
   reconcileEditedFeatures,
   tagFeatureKeys,
@@ -351,6 +353,7 @@ function activateGeoEditor(app: GeoLibreAppAPI): false | undefined {
         mapbox.adaptGeomanToMapbox(geomanInstance, mapboxGl, mapboxMap);
       }
       geoEditorControl.setGeoman(geomanInstance);
+      installMultiLineVertexRemoval(geomanInstance);
       bindGeomanEditSync(map);
     }
   }
@@ -390,12 +393,17 @@ function getGeoEditorOptions(mapboxGl: MapboxGl | null): GeoEditorOptions {
         },
       ],
     },
-    onFeatureCreate: () => {
+    onFeatureCreate: (feature) => {
       unionSketchesWithStoreOnNextSync = true;
-      // Defer until Geoman commits the new feature to its feature store.
+      // GeoEditor opens the attribute panel synchronously after this callback
+      // returns, so a geometry-edit session closes it in the same deferred pass.
+      const isGeometryEditSession = Boolean(editTargetLayerId);
+      // Geoman's callback payload is authoritative even if the collection read
+      // still reflects the pre-create snapshot.
       queueMicrotask(() => {
-        syncSketchesToStore();
+        syncSketchesToStore(feature);
         applySketchesMapDisplay();
+        if (isGeometryEditSession) geoEditorControl?.closeAttributeEditor();
       });
     },
     onFeatureEdit: () => {
@@ -442,6 +450,84 @@ function unbindGeomanEditSync(): void {
   geomanEditSyncMap = null;
 }
 
+/** The parts of Geoman's change-mode `cutVertex` payload this module reads. */
+interface GeomanCutVertexEvent {
+  featureData: {
+    getGeoJson(): Feature;
+    updateGeometry(geometry: MultiLineString): Promise<void>;
+  };
+  markerData: {
+    type: string;
+    position?: { coordinate: Position; path: (string | number)[] };
+  };
+}
+
+/** Geoman's change-mode action instance, as far as vertex removal goes. */
+interface GeomanChangeAction {
+  gm: { features: { delete(feature: unknown): Promise<void> } };
+  cutVertex(event: GeomanCutVertexEvent): Promise<void>;
+  fireFeatureUpdatedEvent(event: {
+    sourceFeatures: unknown[];
+    targetFeatures: unknown[];
+    markerData: unknown;
+  }): Promise<void>;
+}
+
+const MULTILINE_CUT_PATCHED = Symbol("geolibre.multiLineCut");
+
+/**
+ * Lets right-click remove a vertex from a MultiLineString. Geoman's change mode
+ * only implements removal for LineString, Polygon and MultiPolygon, so on a
+ * MultiLineString it logs "EditChange.cutVertex: feature not updated" and
+ * leaves the vertex (discussion #2750). The change-mode action is created each
+ * time Edit is turned on, so this hooks `actionInstances` and wraps that
+ * instance's `cutVertex`; every other geometry still goes to Geoman.
+ *
+ * @param geoman - The Geoman instance the editor drives.
+ */
+function installMultiLineVertexRemoval(geoman: Geoman): void {
+  const instances = geoman.actionInstances as Record<string, unknown>;
+  geoman.actionInstances = new Proxy(instances, {
+    set(target, key, value) {
+      if (key === "edit__change") patchChangeAction(value);
+      return Reflect.set(target, key, value);
+    },
+  }) as Geoman["actionInstances"];
+}
+
+function patchChangeAction(value: unknown): void {
+  const action = value as (GeomanChangeAction & { [MULTILINE_CUT_PATCHED]?: true }) | null;
+  if (!action || typeof action.cutVertex !== "function" || action[MULTILINE_CUT_PATCHED]) return;
+  action[MULTILINE_CUT_PATCHED] = true;
+  const original = action.cutVertex.bind(action);
+  action.cutVertex = async (event) => {
+    const feature = event.featureData?.getGeoJson();
+    const position = event.markerData?.position;
+    if (
+      event.markerData?.type !== "vertex" ||
+      feature?.geometry?.type !== "MultiLineString" ||
+      !position
+    ) {
+      return original(event);
+    }
+    const next = removeMultiLineStringVertex(feature.geometry, position.coordinate, position.path);
+    if (next === undefined) return original(event);
+    if (next === null) {
+      // Same call Geoman makes when a cut leaves too few vertices: it also
+      // drops the feature from the store and selection, which delete() alone
+      // doesn't.
+      await action.gm.features.delete(event.featureData);
+      return;
+    }
+    await event.featureData.updateGeometry(next);
+    await action.fireFeatureUpdatedEvent({
+      sourceFeatures: [event.featureData],
+      targetFeatures: [event.featureData],
+      markerData: event.markerData,
+    });
+  };
+}
+
 function geomanLayerStylesForMap(map: maplibregl.Map, mapbox: boolean) {
   const layerStyles = structuredClone(geoEditorModules!.geoman.defaultLayerStyles);
   const textFont = textFontForMapStyle(map, mapbox ? MAPBOX_TEXT_FONT : MAPLIBRE_TEXT_FONT);
@@ -456,8 +542,26 @@ function geomanLayerStylesForMap(map: maplibregl.Map, mapbox: boolean) {
     }
   }
 
+  // Geoman draws the midpoint "add a vertex here" handles almost exactly like
+  // real vertices (radius 6 vs 7), so editing a line looks like it multiplies
+  // nodes (discussion #2750). Make the handles smaller and fainter.
+  for (const sourceLayers of Object.values(layerStyles.edge_marker ?? {})) {
+    for (const layer of sourceLayers) {
+      if (layer.type !== "circle") continue;
+      layer.paint = { ...layer.paint, ...EDGE_MARKER_PAINT };
+    }
+  }
+
   return layerStyles;
 }
+
+/** Paint for Geoman's midpoint handles, distinct from its vertex markers. */
+const EDGE_MARKER_PAINT = {
+  "circle-radius": 4,
+  "circle-opacity": 0.5,
+  "circle-stroke-width": 1.5,
+  "circle-stroke-opacity": 0.6,
+};
 
 /** The font stack the default MapLibre basemaps serve glyphs for. */
 const MAPLIBRE_TEXT_FONT = ["Noto Sans Regular"];
@@ -586,7 +690,74 @@ function unionFeatureCollections(...collections: FeatureCollection[]): FeatureCo
   return { type: "FeatureCollection", features: [...byKey.values()] };
 }
 
-function syncSketchesToStore(): void {
+/**
+ * Add the feature a create callback reported unless the editor's own read
+ * already holds it. The callback copy may lack, or differ from, the id Geoman
+ * gives the imported feature, so besides a matching id the read counts as
+ * holding it when it has more features with that exact geometry than the
+ * stored Sketches had before. A separate sketch drawn on the same spot as an
+ * existing one is therefore still added while the read lags.
+ */
+export function withCreatedSketch(
+  collection: FeatureCollection,
+  created: Feature,
+  stored: FeatureCollection | undefined,
+): FeatureCollection {
+  const createdId = sketchIdentity(created);
+  const createdGeometry = JSON.stringify(created.geometry);
+  const coincident = (features: Feature[] = []) =>
+    features.filter((feature) => JSON.stringify(feature.geometry) === createdGeometry).length;
+  const present =
+    (createdId != null &&
+      collection.features.some(
+        (feature) => String(sketchIdentity(feature)) === String(createdId),
+      )) ||
+    coincident(collection.features) > coincident(stored?.features);
+  if (present) return collection;
+  return { ...collection, features: [...collection.features, structuredClone(created)] };
+}
+
+function sketchIdentity(feature: Feature): unknown {
+  const props = feature.properties as Record<string, unknown> | null;
+  return feature.id ?? props?.__gm_id;
+}
+
+/**
+ * Drop stored sketches that were saved from an id-less create callback while
+ * the editor read lagged, once the editor holds them under Geoman's id. Each
+ * id-bearing editor feature not already stored under its id supersedes one
+ * id-less stored copy with the same geometry, so a separate sketch on the
+ * same coordinates is kept.
+ */
+export function withoutSupersededSketchCopies(
+  stored: FeatureCollection,
+  editor: FeatureCollection,
+): FeatureCollection {
+  const storedIds = new Set(
+    stored.features
+      .map(sketchIdentity)
+      .filter((id) => id != null)
+      .map(String),
+  );
+  const unclaimed = new Map<string, number>();
+  for (const feature of editor.features) {
+    const id = sketchIdentity(feature);
+    if (id == null || storedIds.has(String(id))) continue;
+    const geometry = JSON.stringify(feature.geometry);
+    unclaimed.set(geometry, (unclaimed.get(geometry) ?? 0) + 1);
+  }
+  const features = stored.features.filter((feature) => {
+    if (sketchIdentity(feature) != null) return true;
+    const geometry = JSON.stringify(feature.geometry);
+    const remaining = unclaimed.get(geometry) ?? 0;
+    if (remaining === 0) return true;
+    unclaimed.set(geometry, remaining - 1);
+    return false;
+  });
+  return features.length === stored.features.length ? stored : { ...stored, features };
+}
+
+function syncSketchesToStore(createdFeature?: Feature): void {
   if (!geoEditorControl || restoringSketchesToEditor) return;
 
   // During a geometry-edit session edits live in the editor and are written
@@ -595,12 +766,16 @@ function syncSketchesToStore(): void {
   // so skip store writes here; `endLayerGeometryEdit` flushes the final state.
   if (editTargetLayerId) return;
 
-  let collection = cloneFeatureCollection(geoEditorControl.getAllFeatureCollection());
   const store = useAppStore.getState();
   const existing = findSketchesLayer(store.layers);
+  let collection = cloneFeatureCollection(geoEditorControl.getAllFeatureCollection());
+  if (createdFeature) collection = withCreatedSketch(collection, createdFeature, existing?.geojson);
 
   if (unionSketchesWithStoreOnNextSync && existing?.geojson) {
-    collection = unionFeatureCollections(existing.geojson, collection);
+    collection = unionFeatureCollections(
+      withoutSupersededSketchCopies(existing.geojson, collection),
+      collection,
+    );
     unionSketchesWithStoreOnNextSync = false;
   }
 
@@ -880,6 +1055,17 @@ export function getGeometryEditTargetLayerId(): string | null {
   return editTargetLayerId;
 }
 
+/**
+ * Whether the geo editor is in a draw or edit mode that acts on right-click
+ * (vertex removal, finishing a draw, the rotate popup). The map's right-click
+ * menu checks this so it doesn't open over the editor's own gesture.
+ *
+ * @returns True while a GeoEditor draw or edit mode is enabled.
+ */
+export function isGeoEditorUsingRightClick(): boolean {
+  return isGeoEditorInteractionMode();
+}
+
 /** Subscribe to geometry-edit session changes (for `useSyncExternalStore`). */
 export function subscribeGeometryEdit(listener: () => void): () => void {
   geometryEditListeners.add(listener);
@@ -1102,6 +1288,23 @@ export async function startLayerGeometryEdit(
 
   applySketchesMapDisplay();
   notifyGeometryEdit();
+  return true;
+}
+
+/**
+ * Select one feature of the active geometry-edit session in the editor, so the
+ * session opened from an Identify result starts on the feature the user picked
+ * (#2932). Select mode stays off: in it the editor would open its attribute
+ * panel, and a geometry session discards attribute changes on save.
+ *
+ * @param featureId The feature's id in the attribute table's scheme.
+ * @returns True when the feature was found and selected.
+ */
+export function selectGeometryEditFeature(featureId: string): boolean {
+  if (!pluginActive || !geoEditorControl || !editTargetLayerId) return false;
+  const match = findGeometryEditFeature(geoEditorControl.getAllFeatureCollection(), featureId);
+  if (!match) return false;
+  geoEditorControl.selectFeatures([match]);
   return true;
 }
 

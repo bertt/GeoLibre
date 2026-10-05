@@ -2,6 +2,7 @@ import { cesiumKmlSource, isCesiumKmlLayer } from "@geolibre/core";
 import { bindDocumentOpacity } from "./cesium-document-opacity";
 import { imageryColorAdjustments } from "./raster-color-adjustments";
 import {
+  allowsCredentialHeaders,
   cesiumIonAssetId,
   compileFeatureExpression,
   compileLayerFilters,
@@ -15,6 +16,8 @@ import {
   resolveThreeDTilesRequestHeaders,
   ruleBasedVisibilityFilter,
   transformGeojsonElevation,
+  resolveProjectHeaderReferences,
+  useAppStore,
   type GeoLibreLayer,
   type LayerStyle,
 } from "@geolibre/core";
@@ -37,7 +40,7 @@ import {
   type ZarrCesiumModule,
 } from "./cesium-zarr-imagery";
 import { getZarrStore } from "./zarr-source";
-import { createFeatureStyleResolver, type FeatureStyleResolver } from "./cesium-feature-style";
+import { createFeatureStyleResolver, type FeatureStyleResolver } from "./feature-style";
 import { createCesiumLabeler, pickLabelPart } from "./cesium-labels";
 import {
   buildPointCloudCollection,
@@ -58,13 +61,12 @@ import {
   type PointRenderPlan,
 } from "./cesium-points";
 import {
-  hasRegisteredProtocol,
   mercatorBbox,
   ProtocolImageryProvider,
-  protocolScheme,
   quadkey,
   webMercatorRectangle,
 } from "./cesium-protocol-imagery";
+import { hasRegisteredProtocol, protocolScheme } from "./protocol-tiles";
 import {
   compileTilesetStyle,
   tilesetStyleKey,
@@ -72,8 +74,14 @@ import {
 } from "./cesium-tileset-style";
 import { renderFillPatternCanvas } from "./fill-patterns";
 import { getLayerBounds } from "./geojson-loader";
-import { classifyLayer, type LayerKind, unhandledLayerKind } from "./layer-kind";
-import { getPMTilesArchive } from "./layer-sync";
+import {
+  classifyLayer,
+  hasLayerKindSupport,
+  type LayerKind,
+  type SupportedLayerKinds,
+} from "./layer-kind";
+import { getPMTilesArchive } from "./pmtiles-archive";
+import { watchImageryTileHealth, type ImageryTileFailure } from "./cesium-imagery-tile-health";
 import { renderMarkerCanvas } from "./markers";
 import { normalizePMTilesUrl } from "./pmtiles-layer";
 import type { Header as PMTilesHeader } from "pmtiles";
@@ -288,12 +296,20 @@ interface LayerEntry {
   abort?: AbortController;
   /** Removes the one-shot tile listener that reads a tileset's attribute names. */
   fieldsListener?: () => void;
+  /** Stops counting an imagery entry's tile loads and failures. */
+  tileHealth?: () => void;
   documentCleanup?: () => void;
   overlayContainer?: HTMLElement;
   /** Static attribution registered for this layer while it is in the scene. */
   credit?: Credit;
   /** Set when the entry is removed mid-load so the resolved handle is discarded. */
   cancelled: boolean;
+  /**
+   * The request headers the entry was built with, resolved from `${NAME}`
+   * references (JSON). The layer keeps only the template, so a changed
+   * variable is detected by comparing this with a fresh resolution.
+   */
+  resolvedHeaders?: string;
   /**
    * Whether {@link handle} is actually in the scene. A geojson entry's handle is
    * assigned as soon as the data source loads, but the data source only joins
@@ -418,28 +434,24 @@ function escapeCreditHtml(value: string): string {
   });
 }
 
+/** See {@link allowsCredentialHeaders}; shared with the 2D 3D Tiles renderers. */
+const allowsCredentials = allowsCredentialHeaders;
+
 /**
- * Whether credential-bearing request headers may be sent to this URL.
- *
- * The scheme is read off a parsed URL rather than matched as a prefix, so an
- * unusually-cased `HTTPS://` from a hand-authored or MCP-generated project is
- * normalized instead of being misread as plaintext. A relative or unparseable
- * URL throws and is refused, matching `isAllowedPluginManifestUrl` in
- * `@geolibre/core`.
+ * A Cesium proxy that refuses any request a credential-bearing resource would
+ * send to a non-secure URL. Cesium hands the proxy to every resource derived
+ * from the tileset's, so child tiles named by absolute `http:` URLs in the
+ * tileset JSON fail instead of receiving the headers.
  */
-function allowsCredentials(url: string): boolean {
-  try {
-    const { protocol, hostname } = new URL(url);
-    if (protocol === "https:") return true;
-    // Loopback over http so a local dev tile server still works.
-    return (
-      protocol === "http:" &&
-      (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]")
-    );
-  } catch {
-    return false;
-  }
-}
+const CREDENTIAL_PROXY = {
+  getURL(url: string): string {
+    // `data:`/`blob:` never leave the process (embedded glTF buffers).
+    if (!/^(?:data|blob):/i.test(url) && !allowsCredentials(url)) {
+      throw new Error(`Request headers are not sent over ${url}`);
+    }
+    return url;
+  },
+};
 
 function firstTile(layer: GeoLibreLayer): string | undefined {
   const tiles = layer.source.tiles;
@@ -572,6 +584,32 @@ function wmtsCapabilities(
 }
 
 /**
+ * What the globe's kind dispatch ({@link isCesiumSupportedLayerType}) does with
+ * each layer kind. The globe has no plugin controls, so every kind it draws is
+ * `"native"` (some only for certain data: a raster archive, a draped style, a
+ * tileset URL). The `"unsupported"` kinds stay in the 2D panes, unless their
+ * record carries a FeatureCollection, CZML or KML, which the globe draws
+ * whatever the kind.
+ */
+export const CESIUM_SUPPORTED_LAYER_KINDS = Object.freeze({
+  geojson: "native",
+  "raster-tiles": "native",
+  "vector-tiles": "native",
+  arcgis: "native",
+  "tile-archive": "native",
+  zarr: "native",
+  lidar: "native",
+  "gaussian-splat": "native",
+  "3d-tiles": "native",
+  cog: "native",
+  "vector-file": "unsupported",
+  "duckdb-query": "unsupported",
+  "deckgl-viz": "unsupported",
+  video: "unsupported",
+  image: "native",
+} as const satisfies SupportedLayerKinds);
+
+/**
  * Whether the globe can render this layer *kind* at all (regardless of whether
  * its data has loaded yet). Exported so the UI can flag "2D only" layers on a
  * globe pane. See the module header for the supported kinds.
@@ -581,6 +619,9 @@ export function isCesiumSupportedLayerType(layer: GeoLibreLayer): boolean {
   // FeatureCollection on a kind that takes the GeoJSON path.
   if (isCzmlLayer(layer) || isCesiumKmlLayer(layer) || hasGeoJsonCollection(layer)) return true;
   const kind = classifyLayer(layer);
+  // No globe renderer (vector files, DuckDB queries, deck.gl, video), or an
+  // unknown type: these stay in the 2D panes.
+  if (hasLayerKindSupport(CESIUM_SUPPORTED_LAYER_KINDS, kind, "unsupported")) return false;
   switch (kind) {
     // GeoJSON (loaded or not yet), imagery (tile templates and a georeferenced
     // image as a single-tile provider) and COGs, which the globe opens itself.
@@ -600,14 +641,6 @@ export function isCesiumSupportedLayerType(layer: GeoLibreLayer): boolean {
     case "vector-tiles":
     case "arcgis":
       return isDrapedLayer(layer);
-    // No globe renderer: these stay in the 2D panes.
-    case "vector-file":
-    case "duckdb-query":
-    case "deckgl-viz":
-    case "video":
-      return false;
-    default:
-      return unhandledLayerKind(kind, false);
   }
 }
 
@@ -909,12 +942,28 @@ export interface CesiumLayerSyncDeps {
    */
   onTilesetFields?: (layerId: string, fields: string[]) => void;
   /**
+   * Called when {@link CesiumLayerSync.zoomToLayer} actually starts a flight,
+   * which for a layer still loading is later than the request. The engine uses
+   * it to stop its terrain correction pulling the flight back (#2878), and only
+   * once the camera is really leaving its placement.
+   */
+  onFlyTo?: () => void;
+  /** Called when a flight started by `onFlyTo` completes (not when cancelled). */
+  onFlyToComplete?: () => void;
+  /**
    * Reports a layer that failed to load, so the app can show it the way the 2D
    * renderers show theirs (the Diagnostics panel). Without this a failure is
    * invisible: the record stays in the Layers panel and the globe simply draws
    * nothing — the shape an Ion asset takes when the account cannot stream it.
    */
   onLayerError?: (error: { layerId: string; layerName: string; message: string }) => void;
+  /**
+   * Reports one failed imagery tile with the layer's tile tallies so far, so
+   * the app can tell a broken URL or a rejected key (every tile fails) from a
+   * sparse tile set (some tiles are simply absent). Capped per layer; see
+   * `cesium-imagery-tile-health.ts`.
+   */
+  onTileFailure?: (failure: ImageryTileFailure & { layerId: string; layerName: string }) => void;
 }
 
 async function readSharedPMTilesHeader(url: string): Promise<PMTilesRasterHeader | undefined> {
@@ -942,6 +991,15 @@ type ImageryResourceFactory = (url: string) => string | Resource;
 /** Refuses (throws) when `what` cannot be sent to `url` over plaintext. */
 type RequireSecure = (url: string, what: string) => void;
 
+/** A layer's request headers with `${NAME}` resolved, as JSON for comparison. */
+function resolvedRequestHeaders(layer: GeoLibreLayer): string {
+  return JSON.stringify(
+    resolveProjectHeaderReferences(
+      layer.source.requestHeaders as Record<string, string> | undefined,
+    ) ?? null,
+  );
+}
+
 /**
  * The credential guard and the URL → `Resource` wrapper every imagery branch
  * builds its provider `url` with.
@@ -950,7 +1008,9 @@ function imageryResourceFactory(
   Cesium: CesiumNs,
   layer: GeoLibreLayer,
 ): { requireSecure: RequireSecure; makeResource: ImageryResourceFactory } {
-  const headers = layer.source.requestHeaders as Record<string, string> | undefined;
+  const headers = resolveProjectHeaderReferences(
+    layer.source.requestHeaders as Record<string, string> | undefined,
+  );
   const hasHeaders = Boolean(headers && Object.keys(headers).length);
   // Credentials (request headers, an ArcGIS token) never go out over
   // plaintext — loopback excepted, so a local dev tile server still works.
@@ -1975,18 +2035,33 @@ export class CesiumLayerSync {
     const handle = entry.handle;
     if (!handle || entry.cancelled || !FLY_TO_KINDS.has(entry.kind)) return false;
     const viewer = this.viewer;
+    // Cesium throws from `flyTo` mid-morph. Drop the fit (reported as handled)
+    // the way the engine's own flights are skipped then.
+    if (viewer.scene.mode === this.Cesium.SceneMode.MORPHING) return true;
     // An I3S scene layer is a `3dtiles` entry, but an I3SDataProvider is not a
     // target `Viewer.flyTo` accepts; it publishes its footprint as a rectangle.
     const extent = (handle as { extent?: Rectangle }).extent;
+    this.deps.onFlyTo?.();
     if (extent) {
-      viewer.camera.flyTo({ destination: extent, duration: ZOOM_TO_LAYER_SECONDS });
+      viewer.camera.flyTo({
+        destination: extent,
+        duration: ZOOM_TO_LAYER_SECONDS,
+        complete: () => this.deps.onFlyToComplete?.(),
+      });
       return true;
     }
     void Promise.resolve(
       viewer.flyTo(handle as ImageryLayer | DataSource | Cesium3DTileset, {
         duration: ZOOM_TO_LAYER_SECONDS,
       }),
-    ).catch(() => {});
+    )
+      // Resolves false when the flight was cancelled. A rejection still ends
+      // the flight the engine was told about, or its terrain correction would
+      // stay off.
+      .then((completed) => {
+        if (completed) this.deps.onFlyToComplete?.();
+      })
+      .catch(() => this.deps.onFlyToComplete?.());
     return true;
   }
 
@@ -2090,6 +2165,28 @@ export class CesiumLayerSync {
     private readonly deps: CesiumLayerSyncDeps = {},
   ) {}
 
+  private unsubscribeEnvironment: (() => void) | null = null;
+
+  /**
+   * Rebuild the imagery and 3D Tiles entries whose `${NAME}` request headers
+   * now resolve differently. The layer records are unchanged when only a
+   * variable changes, so the regular store-driven sync never sees it.
+   */
+  private watchEnvironment(): void {
+    if (this.unsubscribeEnvironment) return;
+    this.unsubscribeEnvironment = useAppStore.subscribe((state, previous) => {
+      if (state.preferences.environmentVariables === previous.preferences.environmentVariables) {
+        return;
+      }
+      const stale = [...this.entries.values()].some(
+        (entry) =>
+          entry.resolvedHeaders !== undefined &&
+          entry.resolvedHeaders !== resolvedRequestHeaders(entry.layer),
+      );
+      if (stale) this.sync(this.currentLayers);
+    });
+  }
+
   /**
    * The Ion token an asset layer loads with. Read at load time rather than at
    * construction, so a token added in Settings reaches the next sync.
@@ -2140,6 +2237,7 @@ export class CesiumLayerSync {
   sync(layers: GeoLibreLayer[]): void {
     this.restoreHighlight();
     this.currentLayers = layers;
+    this.watchEnvironment();
     for (const layer of layers) {
       if (Array.isArray(layer.timeFilter) && layer.timeFilter.length > 0) {
         const d = extractTimeFilterDate(layer.timeFilter);
@@ -2186,7 +2284,11 @@ export class CesiumLayerSync {
       if (!existing) {
         this.createEntry(layer);
         if (entryKind(layer) === "imagery") imageryRebuilt = true;
-      } else if (needsRebuild(existing.layer, layer)) {
+      } else if (
+        needsRebuild(existing.layer, layer) ||
+        (existing.resolvedHeaders !== undefined &&
+          existing.resolvedHeaders !== resolvedRequestHeaders(layer))
+      ) {
         this.destroyEntry(existing);
         this.entries.delete(layer.id);
         // A COG whose source moved (a re-read blob URL, an authoring swap)
@@ -2266,6 +2368,8 @@ export class CesiumLayerSync {
     this.czmlClockOwner = undefined;
     for (const entry of this.entries.values()) this.destroyEntry(entry);
     this.entries.clear();
+    this.unsubscribeEnvironment?.();
+    this.unsubscribeEnvironment = null;
     this.removeDrapeLayer();
     this.drape?.destroy();
     this.drape = undefined;
@@ -2627,6 +2731,9 @@ export class CesiumLayerSync {
   private createEntry(layer: GeoLibreLayer): void {
     const kind = entryKind(layer);
     const entry: LayerEntry = { kind, layer, handle: null, cancelled: false };
+    if ((kind === "imagery" || kind === "3dtiles") && layer.source.requestHeaders) {
+      entry.resolvedHeaders = resolvedRequestHeaders(layer);
+    }
     this.entries.set(layer.id, entry);
     let created: Promise<void> | null = null;
     if (kind === "imagery") created = this.createImagery(entry);
@@ -2806,6 +2913,8 @@ export class CesiumLayerSync {
       // drawing.
       if (this.entries.get(entry.layer.id) === entry) {
         entry.cancelled = true;
+        entry.tileHealth?.();
+        entry.tileHealth = undefined;
         if (entry.handle) {
           viewer.imageryLayers.remove(entry.handle as ImageryLayer, true);
           entry.handle = null;
@@ -3021,6 +3130,14 @@ export class CesiumLayerSync {
     }
     this.imageryRefs.set(imageryLayer, layer.id);
     entry.handle = imageryLayer;
+    const onTileFailure = this.deps.onTileFailure;
+    if (onTileFailure)
+      entry.tileHealth = watchImageryTileHealth(provider, (failure) => {
+        // A rebuilt entry's provider can still settle tiles; only the current
+        // one speaks for the layer.
+        if (this.entries.get(layer.id) !== entry) return;
+        onTileFailure({ ...failure, layerId: layer.id, layerName: layer.name });
+      });
     this.applyAppearance(entry);
     if (isAsync) {
       // Unlike sync()'s reorder this one is unguarded, since the store order
@@ -3347,10 +3464,21 @@ export class CesiumLayerSync {
     // otherwise the tileset would silently 401/403 and never render on the globe.
     const headers = resolveThreeDTilesRequestHeaders(
       url,
-      layer.source.requestHeaders as Record<string, string> | undefined,
+      resolveProjectHeaderReferences(
+        layer.source.requestHeaders as Record<string, string> | undefined,
+      ),
     );
-    const resource =
-      headers && Object.keys(headers).length ? new Cesium.Resource({ url, headers }) : url;
+    const hasHeaders = Boolean(headers && Object.keys(headers).length);
+    if (hasHeaders && !allowsCredentials(url)) {
+      console.warn(
+        `[GeoLibre] skipping "${layer.name}" on the globe: request headers cannot be sent over ${url}`,
+      );
+      entry.loadError = "Request headers require an HTTPS tileset URL";
+      return;
+    }
+    const resource = hasHeaders
+      ? new Cesium.Resource({ url, headers, proxy: CREDENTIAL_PROXY })
+      : url;
     try {
       if (isI3sLayer(layer)) {
         // An ArcGIS scene layer: Cesium's own I3S provider converts the
@@ -3977,6 +4105,8 @@ export class CesiumLayerSync {
     }
     entry.fieldsListener?.();
     entry.fieldsListener = undefined;
+    entry.tileHealth?.();
+    entry.tileHealth = undefined;
     this.storyOpacities.delete(entry.layer.id);
     const { handle } = entry;
     if (!handle) return;

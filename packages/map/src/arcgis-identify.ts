@@ -1,6 +1,7 @@
 import {
   effectiveLayerRenderState,
   IDENTIFY_ALL_LAYERS_ID,
+  identifyAllIncludes,
   isDuckDBQueryLayer,
   isPopupClickEnabled,
   NETCDF_IMAGE_SOURCE_KIND,
@@ -21,12 +22,13 @@ import {
   isAbortError,
   isPixelIdentifyLayer,
   isWmsLayer,
+  isWmsQueryable,
   pixelIdentifyProperties,
   timeSliderBridge,
 } from "./identify-sources";
 import { createIdentifyPopupState, restoreIdentifySelection } from "./map-identify-lifecycle";
 import type { IdentifiedFeature } from "./map-engine";
-import type { MapCanvasRasterIdentify } from "./MapCanvas";
+import type { MapCanvasRasterIdentify } from "./raster-identify";
 
 type ScreenPoint = { x: number; y: number };
 
@@ -120,6 +122,7 @@ export function createArcgisIdentify(host: ArcgisIdentifyHost): {
     const groupById = new Map(next.layerGroups.map((group) => [group.id, group]));
     const eligibleLayers = next.layers.filter(
       (candidate) =>
+        identifyAllIncludes(candidate.id, next.identifyLayerIds) &&
         effectiveLayerRenderState(candidate, groupById).visible &&
         resolveLayerCapabilities(candidate).query &&
         isPopupClickEnabled(candidate.popup),
@@ -162,7 +165,7 @@ export function createArcgisIdentify(host: ArcgisIdentifyHost): {
     };
     const asyncLayers = eligibleLayers.filter(
       (candidate) =>
-        isWmsLayer(candidate) ||
+        (isWmsLayer(candidate) && isWmsQueryable(candidate)) ||
         isPixelIdentifyLayer(candidate) ||
         candidate.type === "cog" ||
         candidate.metadata.sourceKind === NETCDF_IMAGE_SOURCE_KIND,
@@ -295,6 +298,13 @@ export function createArcgisIdentify(host: ArcgisIdentifyHost): {
           return () => host.showPopup(lngLat, message(text), maxWidth);
         }
       });
+      return true;
+    }
+    if (isWmsLayer(layer) && !isWmsQueryable(layer)) {
+      // The capabilities say this layer answers no GetFeatureInfo (#2887).
+      pending?.abort();
+      clearSelection();
+      host.showPopup(lngLat, message(labels.wmsNotQueryable), maxWidth);
       return true;
     }
     if (isWmsLayer(layer)) {

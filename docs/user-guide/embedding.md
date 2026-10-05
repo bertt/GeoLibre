@@ -36,6 +36,7 @@ A chrome-free `maponly` embed shows only the map, as in this shared 3D Tiles pro
 | `theme`      | `theme=dark`                                               | Sets the initial color theme, overriding the OS preference. Accepts `dark` or `light`; the in-app toggle still works afterward.       |
 | `settingsUrl` | `settingsUrl=https://example.com/desktop-settings.json`   | Loads shared presentation settings before the first render. Supports `language`, `layout`, accent `theme`, and `uiProfile`. The override lasts for this page only and does not replace locally saved settings. `settingUrl` is accepted as an alias. |
 | `tool`       | `tool=adaptive_filter`                                     | Opens the Processing (Whitebox toolbox) dialog on a specific tool by its id. Unknown ids open the dialog without preselecting a tool. |
+| `plugin`     | `plugin=swipe`                                             | Activates one or more built-in plugins, as if picked from the Plugins menu. See [Activate a plugin](#deep-linking-a-plugin). |
 
 !!! note "Private projects and data"
     `url=` and `data=` are fetched by the browser with same-origin credentials,
@@ -85,6 +86,46 @@ preselecting a tool or applying any parameters. A known id the current engine
 doesn't expose (WASM in the browser, the Python sidecar on desktop) likewise
 isn't preselected. Tool ids match the Processing menu — the same ids used across
 the [Whitebox toolbox](processing.md).
+
+### Deep-linking a plugin
+
+Use `plugin` to open the app with a built-in plugin already active, as if you
+had picked it from the **Plugins** menu:
+
+```text
+https://web.geolibre.app/?plugin=swipe
+```
+
+Name a plugin by its id (`maplibre-gl-time-slider`) or by its short name, the id
+without a `maplibre-gl-`, `maplibre-`, or `geolibre-` prefix (`time-slider`).
+Short names are case-insensitive. The
+[Plugins page](plugins.md#open-a-plugin-from-a-link) lists every link name. List
+several plugins with commas, or repeat the parameter:
+
+```text
+https://web.geolibre.app/?plugin=graticule,h3-grid
+```
+
+It combines with `url`: the plugin opens once the shared project has loaded, on
+top of the plugins the project itself turns on.
+
+```text
+https://web.geolibre.app/?url=https://share.geolibre.app/giswqs/3d-tiles.geolibre.json&plugin=swipe
+```
+
+A plugin from the official plugin registry works too, by its registry id
+(`?plugin=openrndt-geolibre`). An uninstalled compatible entry prompts for
+**Trust and load**; confirming trust does not bypass deployment plugin policy.
+A denied plugin will not load or activate. In read-only
+`layout=viewer` an installed registry plugin still opens, but the prompt is
+skipped and uninstalled ones are never installed. This is
+distinct from project manifest URL trust, whose prompt is suppressed when
+`sideload: false`. See [Plugin policy](../deployment-policy.md#plugin-precedence).
+
+Unknown names are ignored. A plugin that does not support the current renderer
+does not activate. Directions and reverse geocoding send what you click to a
+public server, so they only open from the menu, after their one-time notice. The
+drawing and editing plugins stay off in `layout=viewer`.
 
 ## Waiting for a screenshot
 
@@ -348,24 +389,38 @@ map.on("selectionChanged", ({ featureIds }) => console.log(featureIds));
 
 ### Enabling it
 
-The API is **off by default**: a public deployment can never be driven by the
-page that frames it. Turn it on by naming the origins you trust. For the Docker
-image, that is one environment variable:
+The API is **off by default**. The primary configuration is
+`sharing.embedOrigins` in [`deployment.json`](../deployment-policy.md). For
+example:
+
+```json
+{
+  "version": 1,
+  "sharing": {
+    "embedOrigins": ["https://portal.example.com", "https://erp.example.com"]
+  }
+}
+```
+
+For Docker, `GEOLIBRE_EMBED_ORIGINS` overrides the policy at container startup:
 
 ```bash
 docker run --rm -p 8080:80 \
   -e GEOLIBRE_EMBED_ORIGINS="https://portal.example.com,https://erp.example.com" \
-  ghcr.io/opengeos/geolibre:latest
+  geolibre-policy:local
 ```
 
-For a static build, bake it in instead:
-`VITE_GEOLIBRE_EMBED_ORIGINS="https://portal.example.com" npm run build`.
+For a static build, the legacy `VITE_GEOLIBRE_EMBED_ORIGINS` build setting is
+still honoured as a fallback. Policy origins are exact `scheme://host[:port]`
+values; the JSON schema does not accept trailing paths. The environment inputs
+retain their existing trailing-path normalization.
 
-Entries are origins (`scheme://host[:port]`); a trailing path is ignored. `*`
-allows any origin and is only appropriate on a private network. The allowlist is
-enforced in both directions: a message from an unlisted origin is ignored, and
-every message the app sends is addressed to a listed origin. (With `*`
-configured, outbound messages are addressed to `*` until the host's first
+`sharing.embedOrigins` entries are exact origins (`scheme://host[:port]`) with
+no trailing path; `*` allows any origin and is only appropriate on a private
+network. The legacy environment inputs retain trailing-path normalization. The
+allowlist is enforced in both directions: a message from an unlisted origin is
+ignored, and every message the app sends is addressed to a listed origin. (With
+`*` configured, outbound messages are addressed to `*` until the host's first
 message identifies it, which is one more reason to name your origins.)
 
 Setting the allowlist also narrows the `?embed=1` project/scripting bridges (used
@@ -375,12 +430,12 @@ you can stop other sites from framing the app at all by adding
 
 The allowlist decides *who* may send commands. To narrow *which* commands exist
 at all — so a trusted host page still cannot turn the embed into a
-general-purpose data-fetching proxy — build with
-[deployment capabilities](../deployment-capabilities.md). A denied command
-rejects with `Missing <capability> capability` rather than silently doing
-nothing: `loadProject` needs `project:edit`, `addLayer` and `addData` need
-`data:add`, `openTool` needs `processing:run`, and `exportImage` needs
-`export:data`. The rest — `setView`, `highlight`, layer visibility — are
+general-purpose data-fetching proxy — configure
+[deployment capabilities](../deployment-capabilities.md) in the runtime
+policy. A denied command rejects with `Missing <capability> capability` rather
+than silently doing nothing: `loadProject` needs `project:edit`, `addLayer` and
+`addData` need `data:add`, `openTool` needs `processing:run`, and `exportImage`
+needs `export:data`. The rest — `setView`, `highlight`, layer visibility — are
 unprivileged and always available.
 
 ### The typed client

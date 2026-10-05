@@ -10,6 +10,7 @@ import {
   isDuckDBQueryLayer,
   isStyleLibraryTargetLayer,
   resolveLayerCapabilities,
+  styleValue,
   useAppStore,
 } from "@geolibre/core";
 import type {
@@ -96,7 +97,11 @@ import { canExportRasterLayer } from "../../../lib/raster-export";
 import { canExtractRasterSubset } from "../../../lib/raster-subset-export";
 import { layerSupportsPolylineExport } from "../../../lib/vector-export";
 import { isTauri } from "../../../lib/is-tauri";
-import { canWriteEditsToSource, isPostgisEditableLayer } from "./layer-panel-utils";
+import {
+  canWriteEditsToSource,
+  isMssqlEditableLayer,
+  isPostgisEditableLayer,
+} from "./layer-panel-utils";
 import type { LayerActions } from "./useLayerActions";
 import type { LayerRefresh } from "./useLayerRefresh";
 import type { TimeSliderBinding } from "./useTimeSliderBinding";
@@ -204,6 +209,7 @@ export function LayerActionsMenuItems({
     handlePasteStyle,
     handleSaveToLibrary,
     handleExportLayer,
+    handleExportExtrusionModel,
     handleExportStyle,
     handleExportGeoLibreStyle,
     handleExportSldStyle,
@@ -269,6 +275,10 @@ export function LayerActionsMenuItems({
   // geojson-backed vector layers carry those features.
   const canExportLayer = layerCaps.export && layer.type === "geojson";
   const canExportPolyline = canExportLayer && layerSupportsPolylineExport(layer);
+  // A 3D model export needs the extrusion it meshes (discussion #2825). The
+  // polygons are checked on export, which scans every feature (a menu-time
+  // sample could miss late or GeometryCollection polygons).
+  const canExport3dModel = canExportLayer && styleValue(layer.style, "extrusionEnabled");
   // Importing a style (Mapbox GL or SLD) only writes the layer's
   // vector symbology, so it applies to any vector-styled layer (local
   // GeoJSON and vector tiles), not just the export-capable GeoJSON
@@ -825,6 +835,32 @@ export function LayerActionsMenuItems({
                 </DropdownMenuItem>
               </>
             )}
+            {canExport3dModel && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onSelect={() => {
+                    void handleExportExtrusionModel(layer, "glb");
+                  }}
+                >
+                  {t("layers.export3dModel", { format: "glTF (.glb)" })}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    void handleExportExtrusionModel(layer, "obj");
+                  }}
+                >
+                  {t("layers.export3dModel", { format: "OBJ" })}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    void handleExportExtrusionModel(layer, "stl");
+                  }}
+                >
+                  {t("layers.export3dModel", { format: "STL" })}
+                </DropdownMenuItem>
+              </>
+            )}
           </DropdownMenuSubContent>
         </DropdownMenuSub>
       )}
@@ -969,7 +1005,16 @@ export function LayerActionsMenuItems({
       )}
       {canWriteBack && (
         <DropdownMenuItem
-          disabled={geometryEditActive || !layerEditable}
+          disabled={
+            geometryEditActive ||
+            !layerEditable ||
+            (isMssqlEditableLayer(layer) && layer.mssqlWritebackPending === true)
+          }
+          title={
+            isMssqlEditableLayer(layer) && layer.mssqlWritebackPending === true
+              ? t("layers.saveEditsMssqlRefreshRequired")
+              : undefined
+          }
           onSelect={() => {
             void handleSaveEditsToSource(layer);
           }}
@@ -977,9 +1022,11 @@ export function LayerActionsMenuItems({
           <Save className="me-2 h-3.5 w-3.5" />
           {isArcGISWritableLayer(layer)
             ? t("layers.saveEditsToArcgis")
-            : isPostgisEditableLayer(layer)
-              ? t("layers.saveEditsToPostgis")
-              : t("layers.saveEditsToSource")}
+            : isMssqlEditableLayer(layer)
+              ? t("layers.saveEditsToMssql")
+              : isPostgisEditableLayer(layer)
+                ? t("layers.saveEditsToPostgis")
+                : t("layers.saveEditsToSource")}
         </DropdownMenuItem>
       )}
       {canEditRasterStyle && (

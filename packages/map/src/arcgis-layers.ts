@@ -8,6 +8,7 @@ import {
   extrusionColorValue,
   extrusionHeightValue,
   generatorCircleRadiusValue,
+  isAdoptedVectorAwaitingFeatures,
   geojsonHasZCoordinates,
   heatmapRampColors,
   labelFieldTextField,
@@ -21,12 +22,12 @@ import {
 } from "@geolibre/core";
 import { createExpression, featureFilter } from "@maplibre/maplibre-gl-style-spec";
 import type { Feature, FeatureCollection, Geometry, Position } from "geojson";
-import { createFeatureStyleResolver, type FeatureSymbol } from "./cesium-feature-style";
+import { createFeatureStyleResolver, type FeatureSymbol } from "./feature-style";
 import { KML_ICON_URL_PROPERTY } from "./markers";
-import { compileMapboxLayer } from "./mapbox-layers";
-import { arcgisVectorStyle } from "./arcgis-vector-style";
+import { compileMapboxLayer } from "./gl-style-compiler";
+import { arcgisVectorStyle } from "./vector-style";
 import { proxyWmsTiles } from "./wms-proxy";
-import { hasRegisteredProtocol, protocolScheme } from "./cesium-protocol-imagery";
+import { hasRegisteredProtocol, protocolScheme } from "./protocol-tiles";
 import {
   isTileTemplate,
   needsTemplateTileLayer,
@@ -48,7 +49,7 @@ import {
   mapboxRenderableMask,
 } from "./derived-geometry";
 import { arcgisLineDecorationSymbol, hasLineDecoration } from "./arcgis-line-decoration";
-import { classifyLayer, unhandledLayerKind } from "./layer-kind";
+import { classifyLayer, hasLayerKindSupport, type SupportedLayerKinds } from "./layer-kind";
 
 /**
  * Translate a store layer into what the ArcGIS Maps SDK can draw (issue #2421).
@@ -66,7 +67,7 @@ import { classifyLayer, unhandledLayerKind } from "./layer-kind";
  * all reach the SDK through that one path, so a new style mode landing in
  * `vector-color.ts` reaches this renderer too.
  *
- * Like `mapbox-layers.ts`, this module is pure — it never imports the SDK —
+ * Like `gl-style-compiler.ts`, this module is pure — it never imports the SDK —
  * and returns a plain, serializable plan that the engine instantiates. That is
  * what makes it unit-testable without a browser or the CDN.
  */
@@ -1868,6 +1869,9 @@ function bounds(layer: GeoLibreLayer): [number, number, number, number] | undefi
  * reported as an error.
  */
 export function isArcgisPluginLayer(layer: GeoLibreLayer): boolean {
+  // Its `source.url` may be GeoParquet or GeoPackage; the vector control fills
+  // `geojson` shortly (see isAdoptedVectorAwaitingFeatures).
+  if (isAdoptedVectorAwaitingFeatures(layer)) return true;
   if (layer.metadata.externalNativeLayer !== true) return false;
   if (layer.geojson || (layer.type === "cog" && cogSourceUrl(layer))) return false;
   const { url, urls, tiles, data } = layer.source as {
@@ -1885,6 +1889,32 @@ export function isArcgisPluginLayer(layer: GeoLibreLayer): boolean {
 }
 
 /**
+ * What the ArcGIS engine's kind dispatch does with each layer kind: the
+ * `"native"` kinds go through {@link compileArcgisLayer} (which still rejects
+ * a record whose data it cannot read), and the `"plugin"` kinds are drawn only
+ * by a plugin on the map's deck.gl overlay ({@link isArcgisExternalDeckLayer}),
+ * so they need an engine whose capabilities include `deckOverlay`. The SDK has
+ * no renderer for the `"unsupported"` kinds.
+ */
+export const ARCGIS_SUPPORTED_LAYER_KINDS = Object.freeze({
+  geojson: "native",
+  "raster-tiles": "native",
+  "vector-tiles": "native",
+  arcgis: "native",
+  "tile-archive": "native",
+  zarr: "native",
+  lidar: "plugin",
+  "gaussian-splat": "unsupported",
+  "3d-tiles": "plugin",
+  cog: "native",
+  "vector-file": "unsupported",
+  "duckdb-query": "plugin",
+  "deckgl-viz": "plugin",
+  video: "unsupported",
+  image: "native",
+} as const satisfies SupportedLayerKinds);
+
+/**
  * Whether a plugin draws the record through the ArcGIS map's deck.gl overlay
  * (the deckgl-viz plugin, DuckDB query results, and the LiDAR and 3D Tiles
  * controls' URL layers), so the engine only needs that overlay to exist.
@@ -1892,6 +1922,9 @@ export function isArcgisPluginLayer(layer: GeoLibreLayer): boolean {
 function isArcgisExternalDeckLayer(layer: GeoLibreLayer): boolean {
   const sourceKind = layer.metadata.sourceKind;
   const kind = classifyLayer(layer);
+  // The other kinds are compiled natively (or rejected by the compiler) from
+  // the record itself.
+  if (!hasLayerKindSupport(ARCGIS_SUPPORTED_LAYER_KINDS, kind, "plugin")) return false;
   switch (kind) {
     case "deckgl-viz":
       return sourceKind === "deckgl-viz";
@@ -1901,21 +1934,6 @@ function isArcgisExternalDeckLayer(layer: GeoLibreLayer): boolean {
       return sourceKind === "duckdb-query";
     case "3d-tiles":
       return sourceKind === "3d-tiles-url";
-    // Compiled natively (or rejected by the compiler) from the record itself.
-    case "geojson":
-    case "raster-tiles":
-    case "vector-tiles":
-    case "arcgis":
-    case "tile-archive":
-    case "zarr":
-    case "gaussian-splat":
-    case "cog":
-    case "vector-file":
-    case "video":
-    case "image":
-      return false;
-    default:
-      return unhandledLayerKind(kind, false);
   }
 }
 
@@ -2149,9 +2167,12 @@ export function compileArcgisLayer(
   // A GetMap template naming its layers is a WMS service the SDK can draw
   // natively. Other bounding-box templates typed `wms` (an ArcGIS
   // `/exportImage`, say) are plain image requests, drawn tile by tile below.
-  // WMS tiles go through the dev server's proxy, as on MapLibre.
+  // WMS tiles go through the dev server's proxy, as on MapLibre. The SDK's
+  // WMSLayer builds its own requests from the service URL and cannot be pointed
+  // through that proxy (it wraps the whole template in `?url=`), so a proxied
+  // service is drawn tile by tile below instead.
   const proxied = proxyWmsTiles(layer.type, tiles);
-  if (layer.type === "wms" && tiles.length && isWmsGetMap(tiles[0]))
+  if (layer.type === "wms" && tiles.length && isWmsGetMap(tiles[0]) && proxied[0] === tiles[0])
     return { ...base, kind: "wms", ...wmsLayerFromTemplate(proxied[0]) };
   if (classifyLayer(layer) === "raster-tiles" && (tiles.length || url)) {
     const templates = proxied.length ? proxied : [url!];

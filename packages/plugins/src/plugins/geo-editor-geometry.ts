@@ -6,7 +6,7 @@ import {
   type EditorTrackingConfig,
   type GeoLibreLayer,
 } from "@geolibre/core";
-import type { Feature, FeatureCollection, Geometry } from "geojson";
+import type { Feature, FeatureCollection, Geometry, MultiLineString, Position } from "geojson";
 
 /**
  * Pure helpers for in-place geometry editing of vector layers. Kept free of the
@@ -105,10 +105,15 @@ function makeIdAllocator(): { take: (preferred?: unknown) => string } {
  */
 export function tagFeatureKeys(collection: FeatureCollection): FeatureCollection {
   const ids = makeIdAllocator();
+  // Explicit ids are claimed first, so an id-less feature's index fallback can
+  // never take an id a later feature really carries (#2932).
+  const explicitIds = collection.features.map((feature) =>
+    feature.id != null && feature.id !== "" ? ids.take(feature.id) : null,
+  );
   let warnedCollision = false;
   return {
     type: "FeatureCollection",
-    features: collection.features.map((feature) => {
+    features: collection.features.map((feature, index) => {
       // Warn once if real data already uses the reserved tag key: that value is
       // overwritten for the session and stripped on save, so the user would
       // otherwise silently lose it.
@@ -123,7 +128,14 @@ export function tagFeatureKeys(collection: FeatureCollection): FeatureCollection
             "property; it will be overwritten for the edit session and removed on save.",
         );
       }
-      const id = ids.take(feature.id);
+      // A feature without an id falls back to its array index, the same id the
+      // attribute table and Identify give it, so an Identify result can find
+      // its feature in the editor (#2932). The allocator still keeps it unique.
+      // Known limitation: when that index is another feature's explicit id,
+      // the app-wide `feature.id ?? index` scheme already gives both features
+      // the same id, so this one gets a fresh tag and an id-based lookup
+      // (findGeometryEditFeature) resolves to the explicit-id feature.
+      const id = explicitIds[index] ?? ids.take(index);
       return {
         ...feature,
         id,
@@ -134,6 +146,23 @@ export function tagFeatureKeys(collection: FeatureCollection): FeatureCollection
       };
     }),
   };
+}
+
+/**
+ * Find a feature in the editor's collection by the id the attribute table and
+ * Identify gave it, through the session's feature-key tag (#2932).
+ *
+ * @param collection The editor's current (tagged) features.
+ * @param featureId The feature's id in the attribute table's scheme.
+ * @returns The matching feature, or undefined when none carries that tag.
+ */
+export function findGeometryEditFeature(
+  collection: FeatureCollection,
+  featureId: string,
+): Feature | undefined {
+  return collection.features.find(
+    (feature) => feature.properties?.[GEOMETRY_EDIT_FID_PROPERTY] === featureId,
+  );
 }
 
 /** Prefix Geoman namespaces its own feature properties with. */
@@ -590,4 +619,45 @@ export function geometryEditMetadata(
       return canonicalGeometryKey(feature.geometry) !== originalGeometries.get(String(tag));
     });
   return changed ? { ...layer.metadata, geometryEdited: true } : layer.metadata;
+}
+
+/**
+ * Removes one vertex from a MultiLineString, which Geoman's own right-click
+ * vertex removal doesn't support (it handles LineString, Polygon and
+ * MultiPolygon only). A part left with fewer than two vertices is dropped.
+ *
+ * @param geometry - The MultiLineString to edit. It isn't mutated.
+ * @param vertex - The vertex to remove, matched on longitude and latitude.
+ * @param path - Geoman's marker path (`[..., partIndex, vertexIndex]`). Used
+ *   when it points at `vertex`, so a repeated coordinate removes the right one.
+ * @returns The new geometry, `null` when no part is left (the caller deletes
+ *   the feature), or `undefined` when `vertex` isn't in `geometry`.
+ */
+export function removeMultiLineStringVertex(
+  geometry: MultiLineString,
+  vertex: Position,
+  path?: readonly (string | number)[],
+): MultiLineString | null | undefined {
+  const same = (a: Position | undefined) => !!a && a[0] === vertex[0] && a[1] === vertex[1];
+  let partIndex = -1;
+  let vertexIndex = -1;
+  const pathPart = path?.[path.length - 2];
+  const pathVertex = path?.[path.length - 1];
+  if (
+    typeof pathPart === "number" &&
+    typeof pathVertex === "number" &&
+    same(geometry.coordinates[pathPart]?.[pathVertex])
+  ) {
+    partIndex = pathPart;
+    vertexIndex = pathVertex;
+  } else {
+    partIndex = geometry.coordinates.findIndex((part) => part.some(same));
+    if (partIndex === -1) return undefined;
+    vertexIndex = geometry.coordinates[partIndex].findIndex(same);
+  }
+
+  const coordinates = geometry.coordinates
+    .map((part, index) => (index === partIndex ? part.filter((_, i) => i !== vertexIndex) : part))
+    .filter((part) => part.length >= 2);
+  return coordinates.length > 0 ? { ...geometry, coordinates } : null;
 }

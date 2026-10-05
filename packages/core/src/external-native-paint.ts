@@ -122,5 +122,26 @@ export function rendererAppliesOpacity(
   layer: { type: string },
   renderer: string | undefined,
 ): boolean {
+  // @geolibre/core sits below @geolibre/map and cannot read its capabilities;
+  // these are the renderers whose `nativeZarr` is set, which a test pins.
+  // eslint-disable-next-line local/no-renderer-kind-checks -- see above
   return (renderer === "arcgis" || renderer === "cesium") && layer.type === "zarr";
+}
+
+/**
+ * Whether `layer` is an Add Vector Layer layer GeoLibre adopted
+ * (`maplibre-gl-vector-adopted`, ADOPTED_VECTOR_SOURCE_KIND in
+ * @geolibre/plugins) that has no features yet. A project saves a URL- or
+ * path-backed adopted layer without them, and the vector control reads them
+ * again on reopen. Until then its `source.url` may name GeoParquet or
+ * GeoPackage, so a renderer must wait rather than load that URL as GeoJSON.
+ *
+ * @param layer - A store layer.
+ * @returns True while the adopted layer awaits its features.
+ */
+export function isAdoptedVectorAwaitingFeatures(layer: {
+  metadata: Record<string, unknown>;
+  geojson?: unknown;
+}): boolean {
+  return layer.metadata.sourceKind === "maplibre-gl-vector-adopted" && !layer.geojson;
 }

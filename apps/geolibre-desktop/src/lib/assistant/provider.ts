@@ -1,4 +1,5 @@
 import type { Model } from "@strands-agents/sdk";
+import { getDeploymentPolicy, readDeploymentEnv } from "../deployment-env";
 
 /**
  * Supported LLM providers for the natural-language assistant. The boundary is
@@ -37,7 +38,8 @@ export interface BedrockCredentials {
 /**
  * A named, saved profile that bundles a provider, model, and credential values
  * together so users can define multiple LLM configurations and switch between
- * them. Profiles are stored in DesktopSettings (localStorage), never in the
+ * them. Profiles are stored in DesktopSettings (secret fields in the OS
+ * credential store on desktop, localStorage on the web), never in the
  * shared project file.
  */
 export interface AssistantProfile {
@@ -326,10 +328,17 @@ export function readBuildTimeAssistantEnv(
   if (fastPathUrl) {
     result.GEOLIBRE_FAST_PATH_URL = managedProxyPath(fastPathUrl, baseOrigin);
   }
-  const proxyUrl = viteEnv.VITE_GEOLIBRE_AI_URL?.trim().replace(/\/+$/, "");
+  // deployment.json `ai`: `enabled: false` removes the managed proxy whichever
+  // env supplied it; `model` outranks the env's model.
+  const aiPolicy = getDeploymentPolicy()?.ai;
+  const proxyUrl =
+    aiPolicy?.enabled === false
+      ? undefined
+      : viteEnv.VITE_GEOLIBRE_AI_URL?.trim().replace(/\/+$/, "");
   if (proxyUrl) {
     result.OPENAI_COMPATIBLE_BASE_URL = managedProxyBaseUrl(proxyUrl, baseOrigin);
     result.OPENAI_COMPATIBLE_MODEL =
+      aiPolicy?.model?.trim() ||
       viteEnv.VITE_GEOLIBRE_AI_MODEL?.trim() ||
       result.OPENAI_COMPATIBLE_MODEL ||
       "openai/gpt-5.6-luna";
@@ -340,11 +349,7 @@ export function readBuildTimeAssistantEnv(
 /** Public proxy configuration injected by the Docker entrypoint at container startup. */
 export function readDeploymentAssistantEnv(): RuntimeEnv {
   if (typeof window === "undefined") return {};
-  const deploymentEnv = (
-    window as unknown as {
-      __GEOLIBRE_DEPLOYMENT_ENV__?: Record<string, string | undefined>;
-    }
-  ).__GEOLIBRE_DEPLOYMENT_ENV__;
+  const deploymentEnv = readDeploymentEnv();
   const result = readBuildTimeAssistantEnv(deploymentEnv, browserOrigin());
   if (result.OPENAI_COMPATIBLE_BASE_URL) {
     result.GEOLIBRE_AI_PROXY_BASE_URL = result.OPENAI_COMPATIBLE_BASE_URL;
