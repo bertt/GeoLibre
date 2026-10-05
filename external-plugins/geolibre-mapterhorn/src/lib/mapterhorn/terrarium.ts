@@ -14,11 +14,19 @@ export const MAPTERHORN_TILE_SIZE = 512;
 export const MAPTERHORN_ENCODING = "terrarium" as const;
 export const MAPTERHORN_MAX_ZOOM = 14;
 
-/** Builds the concrete tile URL for a given tile coordinate. */
-export function mapterhornTileUrl(z: number, x: number, y: number): string {
-  return MAPTERHORN_TILE_URL_TEMPLATE.replace("{z}", String(z))
-    .replace("{x}", String(x))
-    .replace("{y}", String(y));
+/**
+ * Builds the concrete tile URL for a given tile coordinate. `template`
+ * defaults to the stock Mapterhorn URL but accepts the user-overridable
+ * template from `MapterhornSettings.tileUrlTemplate` (see settings.ts) so a
+ * self-hosted/mirrored `{z}/{x}/{y}` terrarium source can be used instead.
+ */
+export function mapterhornTileUrl(
+  z: number,
+  x: number,
+  y: number,
+  template: string = MAPTERHORN_TILE_URL_TEMPLATE,
+): string {
+  return template.replace("{z}", String(z)).replace("{x}", String(x)).replace("{y}", String(y));
 }
 
 /**

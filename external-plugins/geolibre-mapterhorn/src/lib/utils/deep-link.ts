@@ -13,11 +13,6 @@ const PARAM_KEYS: Record<string, keyof MapterhornSettings> = {
   mtHillshade: "hillshadeStrength",
   mtDirection: "hillshadeDirection",
   mtTerrain3d: "terrain3d",
-  mtContours: "contours",
-  mtContourInterval: "contourInterval",
-  mtContourSmoothing: "contourSmoothing",
-  mtTrimOutliers: "trimOutliers",
-  mtOutlierPercentile: "outlierPercentile",
 };
 
 export const MAPTERHORN_URL_PARAMETER_NAMES = Object.keys(PARAM_KEYS);

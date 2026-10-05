@@ -1,7 +1,13 @@
-import type { ContourSmoothing } from "./contours";
+import { MAPTERHORN_TILE_URL_TEMPLATE } from "./terrarium";
 
 /** All user-tunable Mapterhorn plugin settings, persisted via project state. */
 export type MapterhornSettings = {
+  /**
+   * `{z}/{x}/{y}` terrain-tile URL template, editable in the panel so a
+   * self-hosted/mirrored terrarium-encoded source can replace the stock
+   * Mapterhorn endpoint. Defaults to `MAPTERHORN_TILE_URL_TEMPLATE`.
+   */
+  tileUrlTemplate: string;
   /** Whether the Mapterhorn hillshade/terrain layers are visible. */
   enabled: boolean;
   /** Vertical exaggeration applied to both 2D relief shading and 3D terrain. */
@@ -12,36 +18,21 @@ export type MapterhornSettings = {
   hillshadeDirection: number;
   /** Pitched 3D terrain mode (`map.setTerrain(...)`) vs. flat 2D shading. */
   terrain3d: boolean;
-  /** Contour line overlay toggle (default off). */
-  contours: boolean;
-  /** Contour interval in meters. */
-  contourInterval: number;
-  contourSmoothing: ContourSmoothing;
-  /** Outlier-trim toggle for the color scale (default on). */
-  trimOutliers: boolean;
-  /** Percent (0-49) trimmed from each tail of the elevation histogram. */
-  outlierPercentile: number;
 };
 
 export const DEFAULT_SETTINGS: MapterhornSettings = {
+  tileUrlTemplate: MAPTERHORN_TILE_URL_TEMPLATE,
   enabled: true,
   exaggeration: 1.5,
   hillshadeStrength: 0.5,
   hillshadeDirection: 315,
   terrain3d: true,
-  contours: false,
-  contourInterval: 100,
-  contourSmoothing: "gentle",
-  trimOutliers: true,
-  outlierPercentile: 2,
 };
 
 export const SETTINGS_LIMITS = {
   exaggeration: { min: 0, max: 5, step: 0.1 },
   hillshadeStrength: { min: 0, max: 1, step: 0.05 },
   hillshadeDirection: { min: 0, max: 360, step: 1 },
-  contourInterval: { min: 5, max: 1000, step: 5 },
-  outlierPercentile: { min: 0, max: 25, step: 0.5 },
 } as const;
 
 function clamp(value: number, min: number, max: number): number {
@@ -57,6 +48,9 @@ export function normalizeSettings(
   const merged: MapterhornSettings = { ...base, ...patch };
   return {
     ...merged,
+    // Blank/whitespace-only input falls back to the stock Mapterhorn URL
+    // rather than leaving the plugin with an empty tile template.
+    tileUrlTemplate: merged.tileUrlTemplate?.trim() || MAPTERHORN_TILE_URL_TEMPLATE,
     exaggeration: clamp(merged.exaggeration, SETTINGS_LIMITS.exaggeration.min, SETTINGS_LIMITS.exaggeration.max),
     hillshadeStrength: clamp(
       merged.hillshadeStrength,
@@ -66,15 +60,5 @@ export function normalizeSettings(
     hillshadeDirection: Number.isFinite(merged.hillshadeDirection)
       ? ((merged.hillshadeDirection % 360) + 360) % 360
       : DEFAULT_SETTINGS.hillshadeDirection,
-    contourInterval: clamp(
-      merged.contourInterval,
-      SETTINGS_LIMITS.contourInterval.min,
-      SETTINGS_LIMITS.contourInterval.max,
-    ),
-    outlierPercentile: clamp(
-      merged.outlierPercentile,
-      SETTINGS_LIMITS.outlierPercentile.min,
-      SETTINGS_LIMITS.outlierPercentile.max,
-    ),
   };
 }

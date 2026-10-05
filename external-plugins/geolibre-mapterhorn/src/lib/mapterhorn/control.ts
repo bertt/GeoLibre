@@ -21,8 +21,19 @@ export class MapterhornControl implements IControl {
     button.type = "button";
     button.setAttribute("aria-label", "Mapterhorn");
     button.title = "Mapterhorn";
+    // Flex-centers the SVG in the button: MapLibre's other built-in controls
+    // center their icon via a `background-image`, which auto-centers, but an
+    // inline <svg> child needs explicit centering or it sits at the button's
+    // default top-left text-flow position.
+    button.style.display = "flex";
+    button.style.alignItems = "center";
+    button.style.justifyContent = "center";
+    // Explicit stroke color, not `currentColor`: MapLibre's `.maplibregl-ctrl-group`
+    // button background is hardcoded white regardless of GeoLibre's theme, and in
+    // dark mode `currentColor` resolves to the page's light (near-white) text
+    // color, rendering an invisible white-on-white icon.
     button.innerHTML =
-      '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" ' +
+      '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#4b5563" stroke-width="2" ' +
       'stroke-linecap="round" stroke-linejoin="round"><path d="M3 20 L9 9 L13 15 L16 10 L21 20 Z"/></svg>';
     button.addEventListener("click", () => this.onToggle());
 

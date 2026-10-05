@@ -12,20 +12,19 @@ describe("normalizeSettings", () => {
     expect(normalizeSettings({ hillshadeDirection: -10 }).hillshadeDirection).toBe(350);
   });
 
-  it("clamps outlier percentile to [0, 25]", () => {
-    expect(normalizeSettings({ outlierPercentile: 40 }).outlierPercentile).toBe(25);
-    expect(normalizeSettings({ outlierPercentile: -5 }).outlierPercentile).toBe(0);
-  });
-
   it("merges a partial patch onto the provided base rather than always the defaults", () => {
     const base = normalizeSettings({ exaggeration: 3 }, DEFAULT_SETTINGS);
-    const next = normalizeSettings({ contours: true }, base);
+    const next = normalizeSettings({ terrain3d: false }, base);
     expect(next.exaggeration).toBe(3);
-    expect(next.contours).toBe(true);
+    expect(next.terrain3d).toBe(false);
   });
 
   it("leaves values already within range untouched", () => {
-    const result = normalizeSettings({ outlierPercentile: 4.2 });
-    expect(result.outlierPercentile).toBe(4.2);
+    const result = normalizeSettings({ hillshadeStrength: 0.42 });
+    expect(result.hillshadeStrength).toBe(0.42);
+  });
+
+  it("falls back to the stock tile URL for blank input", () => {
+    expect(normalizeSettings({ tileUrlTemplate: "  " }).tileUrlTemplate).toBe(DEFAULT_SETTINGS.tileUrlTemplate);
   });
 });

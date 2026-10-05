@@ -1,18 +1,15 @@
 import { SETTINGS_LIMITS, type MapterhornSettings } from "../mapterhorn/settings";
-import type { OutlierTrimResult } from "../mapterhorn/outlier-stats";
 
 const CSS_PREFIX = "geolibre-mapterhorn";
 
 export type MapterhornPanelHandle = {
-  /** Updates the stats readout after a tile decodes (see `layer-manager.ts`'s `onStatsUpdated`). */
-  setStats: (stats: OutlierTrimResult) => void;
   destroy: () => void;
 };
 
 /**
  * Renders the plugin's right-sidebar panel body: sliders/toggles for every
- * `MapterhornSettings` field, plus a live outlier-statistics readout. Plain
- * DOM per the `registerRightPanel` contract (no React).
+ * `MapterhornSettings` field. Plain DOM per the `registerRightPanel`
+ * contract (no React).
  */
 export function renderMapterhornPanel(
   container: HTMLElement,
@@ -35,6 +32,11 @@ export function renderMapterhornPanel(
   };
 
   appendToggle(form, "Show terrain shading", settings.enabled, (value) => emit({ enabled: value }));
+
+  appendSection(form, "Source");
+  appendTextInput(form, "Tile URL template", settings.tileUrlTemplate, (value) =>
+    emit({ tileUrlTemplate: value }),
+  );
 
   appendSection(form, "Relief");
   appendSlider(
@@ -60,50 +62,7 @@ export function renderMapterhornPanel(
   );
   appendToggle(form, "3D terrain", settings.terrain3d, (value) => emit({ terrain3d: value }));
 
-  appendSection(form, "Contours");
-  appendToggle(form, "Show contours", settings.contours, (value) => emit({ contours: value }));
-  appendSlider(
-    form,
-    "Contour interval (m)",
-    settings.contourInterval,
-    SETTINGS_LIMITS.contourInterval,
-    (value) => emit({ contourInterval: value }),
-  );
-  appendSelect(
-    form,
-    "Contour smoothing",
-    [
-      { value: "off", label: "Off" },
-      { value: "gentle", label: "Gentle" },
-      { value: "strong", label: "Strong" },
-    ],
-    settings.contourSmoothing,
-    (value) => emit({ contourSmoothing: value as MapterhornSettings["contourSmoothing"] }),
-  );
-
-  appendSection(form, "Outlier trim");
-  appendToggle(form, "Trim outliers", settings.trimOutliers, (value) => emit({ trimOutliers: value }));
-  appendSlider(
-    form,
-    "Outlier percentile (%)",
-    settings.outlierPercentile,
-    SETTINGS_LIMITS.outlierPercentile,
-    (value) => emit({ outlierPercentile: value }),
-  );
-
-  const statsEl = document.createElement("div");
-  statsEl.className = `${CSS_PREFIX}-stats`;
-  statsEl.textContent = "Elevation statistics: waiting for tiles\u2026";
-  form.appendChild(statsEl);
-
   return {
-    setStats(stats: OutlierTrimResult): void {
-      const format = (value: number) => `${Math.round(value)} m`;
-      statsEl.textContent =
-        `Observed: ${format(stats.observedMin)} \u2013 ${format(stats.observedMax)} ` +
-        `\u2022 Trimmed: ${format(stats.min)} \u2013 ${format(stats.max)} ` +
-        `\u2022 Samples: ${stats.sampleCount.toLocaleString()}`;
-    },
     destroy(): void {
       container.innerHTML = "";
     },
@@ -169,30 +128,30 @@ function formatSliderValue(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(2);
 }
 
-function appendSelect(
+/**
+ * Text input row, used for the Mapterhorn tile URL template. Commits on
+ * `change` (blur/Enter) rather than every keystroke, so editing the URL does
+ * not retrigger tile fetches on each character typed.
+ */
+function appendTextInput(
   parent: HTMLElement,
   label: string,
-  options: ReadonlyArray<{ value: string; label: string }>,
-  selected: string,
+  value: string,
   onChange: (value: string) => void,
 ): void {
   const row = document.createElement("label");
-  row.className = `${CSS_PREFIX}-row ${CSS_PREFIX}-select`;
+  row.className = `${CSS_PREFIX}-row ${CSS_PREFIX}-text-input`;
 
   const labelEl = document.createElement("span");
   labelEl.textContent = label;
 
-  const select = document.createElement("select");
-  for (const option of options) {
-    const optionEl = document.createElement("option");
-    optionEl.value = option.value;
-    optionEl.textContent = option.label;
-    optionEl.selected = option.value === selected;
-    select.appendChild(optionEl);
-  }
-  select.addEventListener("change", () => onChange(select.value));
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = value;
+  input.spellcheck = false;
+  input.addEventListener("change", () => onChange(input.value));
 
-  row.append(labelEl, select);
+  row.append(labelEl, input);
   parent.appendChild(row);
 }
 
@@ -210,22 +169,17 @@ function injectStyleOnce(): void {
 .${CSS_PREFIX}-row { display: flex; align-items: center; gap: 8px; }
 .${CSS_PREFIX}-slider { flex-direction: column; align-items: stretch; gap: 2px; }
 .${CSS_PREFIX}-slider-label { display: flex; justify-content: space-between; }
-.${CSS_PREFIX}-select { justify-content: space-between; }
-.${CSS_PREFIX}-select select {
-  /* Explicit, host-independent colors: the host panel's own text/background
-     rules only style this <select>'s closed box, not the native dropdown
-     popup the browser renders for its options (which otherwise inherits a
-     dark theme's white text over its own light system background, making
-     every option invisible). color-scheme pins that popup to a normal
-     light rendering everywhere, matching these explicit colors. */
+.${CSS_PREFIX}-text-input { flex-direction: column; align-items: stretch; gap: 2px; }
+.${CSS_PREFIX}-text-input input {
   color-scheme: light;
   background: #ffffff;
   color: #111111;
   border: 1px solid #c9ccd1;
   border-radius: 4px;
-  padding: 2px 6px;
+  padding: 4px 6px;
+  font-size: 12px;
+  font-family: monospace;
 }
-.${CSS_PREFIX}-stats { margin-top: 8px; font-size: 12px; opacity: 0.75; line-height: 1.4; }
 `.trim();
   document.head.appendChild(style);
 }

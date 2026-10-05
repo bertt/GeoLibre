@@ -1,11 +1,8 @@
 # Mapterhorn — a GeoLibre plugin
 
-An external [GeoLibre](https://github.com/opengeos/geolibre) plugin that
-recreates the core functionality of
-[relief.bertspaan.nl](https://relief.bertspaan.nl): live global shaded relief
-with vertical exaggeration, optional 3D terrain, and contour lines with
-outlier-trimmed elevation statistics — all from
-[Mapterhorn](https://mapterhorn.com)'s free, global terrain tiles.
+An external [GeoLibre](https://github.com/opengeos/geolibre) plugin providing
+live global shaded relief with vertical exaggeration and optional 3D terrain,
+all from [Mapterhorn](https://mapterhorn.com)'s free, global terrain tiles.
 
 Plugin id: `geolibre-mapterhorn` · Display name: **Mapterhorn**.
 
@@ -20,23 +17,14 @@ Plugin id: `geolibre-mapterhorn` · Display name: **Mapterhorn**.
   the camera auto-tilts to a 60° pitch when enabled (and back on disable, if
   the plugin was the one that introduced the tilt) so displaced relief is
   actually visible.
-- **Contours** — optional contour lines (marching squares), rendered as a
-  `map.project()`-synced 2D canvas overlay (MapLibre GL JS has no
-  `type: "custom"` **source** an external plugin bundle can register — see
-  `contour-overlay.ts`'s docstring), with interval and smoothing controls
-  (default off). This overlay is a flat 2D layer, so contours are
-  **2D-only by design**: they are automatically hidden whenever 3D terrain is
-  on or the map is in globe projection (3D/globe mode shows hillshade +
-  terrain only).
-- **Outlier trimming** — percentile-based min/max clipping (default on, 2%)
-  feeding a live elevation-statistics readout (observed min/max, sample
-  count). It no longer affects color scaling directly (see "Design notes"
-  below for why the color ramp feature was removed).
+- **Tile URL template** — editable in the panel's "Source" section, so a
+  self-hosted/mirrored terrarium-encoded source can replace the stock
+  Mapterhorn endpoint (`https://tiles.mapterhorn.com/{z}/{x}/{y}.webp`
+  default). Blank input falls back to the default.
 
 There is a single elevation source (Mapterhorn, global coverage, terrarium
-encoding, `https://tiles.mapterhorn.com/{z}/{x}/{y}.webp`) — no WCS, no
-datasource picker, matching this plugin's simplified scope relative to the
-original Relief app (see "Non-goals" in the design notes below).
+encoding) — no WCS, no datasource picker, keeping this plugin's scope
+intentionally simple (see "Non-goals" in the design notes below).
 
 ## Install
 
@@ -109,8 +97,7 @@ toggles described above.
 - **Automated:**
 
   ```bash
-  npm test          # Vitest — pure logic: terrarium decode, outlier
-                     # statistics, contour extraction, settings/deep-link
+  npm test          # Vitest — pure logic: terrarium decode, settings/deep-link
   npm run typecheck  # tsc --noEmit
   npm run lint       # ESLint
   npm run build:geolibre
@@ -118,22 +105,14 @@ toggles described above.
 
 - **Manual, in GeoLibre:**
   1. Activate the plugin; confirm shaded relief renders globally and near
-     `52.18648, 5.37228` (the original Relief app's shared location).
+     `52.18648, 5.37228` (a sample Netherlands location).
   2. Move the **vertical exaggeration** and **hillshade strength/direction**
      sliders; confirm the shading updates live.
   3. Toggle **3D terrain**; confirm the map tilts/extrudes and follows the
-     exaggeration slider, and that the contour overlay hides itself while 3D
-     is on (it is a flat 2D canvas synced via `map.project()`, so it only
-     makes sense for a top-down view — see `contour-overlay.ts`'s
-     docstring).
-  4. Toggle 3D back off; confirm the contour overlay reappears if contours
-     are enabled.
-  5. Toggle **contours** on; adjust **interval** and **smoothing**; confirm
-     lines redraw at the new interval.
-  7. Toggle **trim outliers** off/on and move the **outlier percentile**
-     slider; confirm the elevation-statistics readout
-     (`Observed: … • Trimmed: … • Samples: …`) updates.
-  8. Deactivate and reactivate the plugin; confirm settings persist through
+     exaggeration slider.
+  4. Edit the **Tile URL template** field; confirm the hillshade/terrain
+     re-fetch from the new URL.
+  5. Deactivate and reactivate the plugin; confirm settings persist through
      the project's saved state (`getProjectState`/`applyProjectState`).
 
 ## Desktop CSP note
@@ -148,47 +127,24 @@ to add the host, or use the web build (unaffected by this restriction).
 
 - Single elevation source (Mapterhorn) — no WCS/PDOK integration, no
   World/Netherlands datasource toggle (dropped from the original request's
-  scope by explicit follow-up decision).
-- **No hypsometric color tinting.** An earlier version rendered a
-  color-ramp tint via the same flat 2D canvas overlay as the contours, but a
-  flat overlay only makes sense in 2D top-down view — and since 3D terrain
-  is on by default, that limitation would apply to the color ramp on every
-  fresh activation. Rather than accept a feature that mostly doesn't render,
-  or build a native `color-relief` MapLibre layer (a bigger scope increase),
-  the color ramp was removed outright; only contours remain as a 2D-only
-  overlay feature, matching the explicit decision to keep contours 2D-only
-  as well.
-- No seafloor mode, grid overlay, or share links — cosmetic extras from the
-  original Relief app, out of scope for v1.
+  scope by explicit follow-up decision). The tile URL template is editable
+  in the panel, so a compatible mirror/self-hosted source can be swapped in
+  without a code change.
+- No contour lines, hypsometric color tinting, seafloor mode, grid overlay,
+  or share links (contours were explicitly removed after an earlier
+  iteration; the rest were out of scope for v1).
 - MapLibre-only (`engines: ["maplibre"]`) — no Cesium/Mapbox/ArcGIS support.
 - **Expected 404s over open ocean**: Mapterhorn only publishes tiles over
   landmass (confirmed by probing `tiles.mapterhorn.com` directly — the same
   `z/x/y` returns `200` over the Netherlands and `404` over open ocean at
-  higher zooms). Both the native `raster-dem` source and this plugin's
-  contour overlay fetch the same tiles, so panning/zooming over open water
-  logs harmless 404s in GeoLibre's network diagnostics; this is inherent to
-  Mapterhorn's coverage, not a plugin bug.
-- The contour overlay is a flat, unprojected 2D canvas (see
-  `contour-overlay.ts`'s docstring) — it does not handle the antimeridian
-  and is hidden whenever 3D terrain is on or the map is in globe projection.
-  Contours are a **2D-only feature by design**; making them drape over 3D
-  terrain/globe would require a native MapLibre vector line layer instead of
-  a canvas overlay, left as a known limitation rather than built for v1.
+  higher zooms). This is inherent to Mapterhorn's coverage, not a plugin bug.
 
 ## Code reuse
 
-The plugin has **no runtime dependency on `@geolibre/core`**. One small, pure
-module was copied in from the monorepo instead of imported as an npm
-dependency, so the plugin stays a single self-contained bundle that a
-browser can `import()` with no import map:
+The plugin has **no runtime dependency on `@geolibre/core`** and no
+monorepo-internal copied modules — it is a single self-contained bundle that
+a browser can `import()` with no import map.
 
-- `src/lib/mapterhorn/outlier-stats.ts` — percentile/histogram math ported
-  from `packages/plugins/src/plugins/raster-symbology.ts` (a `private`
-  workspace package, not published to npm, so it could not be a dependency
-  either way).
-
-If this plugin is later extracted to its own repository, this file is
-already fully self-contained and needs no further changes.
 
 ## Repository layout
 
@@ -200,13 +156,10 @@ external-plugins/geolibre-mapterhorn/
       geolibre/host-api.ts         # GeoLibre plugin contract (types only)
       mapterhorn/
         terrarium.ts               # tile URL + terrarium decode (pure)
-        tile-math.ts                # slippy-tile lng/lat <-> tile-index math (pure)
-        outlier-stats.ts           # running histogram + percentile trim (pure)
-        contours.ts                # marching-squares contour extraction + smoothing (pure)
         settings.ts                # MapterhornSettings type, defaults, clamping
-        contour-overlay.ts          # map.project()-synced 2D canvas overlay: contour lines + stats sampling
-        layer-manager.ts           # wires raster-dem/hillshade/terrain + the contour overlay
+        layer-manager.ts           # wires raster-dem/hillshade/terrain layers
         control.ts                 # minimal map control (toggles the right panel)
+        icon.ts                    # shared-rail icon data URI
       panel/panel.ts               # right-sidebar DOM UI
       utils/deep-link.ts           # URL query-parameter round-trip
   tests/                           # Vitest unit tests for the pure modules above

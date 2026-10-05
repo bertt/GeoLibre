@@ -10,11 +10,6 @@ describe("encodeSettingsToUrlParams / decodeSettingsFromUrlParams", () => {
       hillshadeStrength: 0.8,
       hillshadeDirection: 200,
       terrain3d: true,
-      contours: true,
-      contourInterval: 50,
-      contourSmoothing: "strong" as const,
-      trimOutliers: false,
-      outlierPercentile: 5,
     };
     const params = encodeSettingsToUrlParams(settings);
     const decoded = decodeSettingsFromUrlParams(params, DEFAULT_SETTINGS);
@@ -22,11 +17,6 @@ describe("encodeSettingsToUrlParams / decodeSettingsFromUrlParams", () => {
     expect(decoded.hillshadeStrength).toBe(0.8);
     expect(decoded.hillshadeDirection).toBe(200);
     expect(decoded.terrain3d).toBe(true);
-    expect(decoded.contours).toBe(true);
-    expect(decoded.contourInterval).toBe(50);
-    expect(decoded.contourSmoothing).toBe("strong");
-    expect(decoded.trimOutliers).toBe(false);
-    expect(decoded.outlierPercentile).toBe(5);
   });
 
   it("leaves the base settings untouched for params that are absent", () => {
@@ -35,9 +25,8 @@ describe("encodeSettingsToUrlParams / decodeSettingsFromUrlParams", () => {
   });
 
   it("decodes boolean params from '1'/'0'", () => {
-    const params = new URLSearchParams({ mtTerrain3d: "1", mtTrimOutliers: "0" });
+    const params = new URLSearchParams({ mtTerrain3d: "1" });
     const decoded = decodeSettingsFromUrlParams(params, DEFAULT_SETTINGS);
     expect(decoded.terrain3d).toBe(true);
-    expect(decoded.trimOutliers).toBe(false);
   });
 });

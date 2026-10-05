@@ -1,5 +1,6 @@
 import type { GeoLibreAppAPI, GeoLibrePlugin } from "./lib/geolibre/host-api";
 import { MapterhornControl } from "./lib/mapterhorn/control";
+import { MAPTERHORN_ICON_DATA_URI } from "./lib/mapterhorn/icon";
 import { MAPTERHORN_DEM_SOURCE_ID, MAPTERHORN_HILLSHADE_LAYER_ID, MapterhornLayerManager } from "./lib/mapterhorn/layer-manager";
 import { DEFAULT_SETTINGS, normalizeSettings, type MapterhornSettings } from "./lib/mapterhorn/settings";
 import { renderMapterhornPanel, type MapterhornPanelHandle } from "./lib/panel/panel";
@@ -39,7 +40,7 @@ const plugin: GeoLibrePlugin = {
       return false;
     }
 
-    layerManager = new MapterhornLayerManager(map, settings, (stats) => panelHandle?.setStats(stats));
+    layerManager = new MapterhornLayerManager(map, settings);
     layerManager.mount();
 
     // Mirror the native hillshade layer into GeoLibre's Layers panel so it
@@ -48,12 +49,10 @@ const plugin: GeoLibrePlugin = {
     // (only exaggeration/illumination-direction, both plugin-owned sliders in
     // the right panel), so this uses `paintMode: "plugin"` and only bridges
     // visibility — see docs/plugin-api.md's "Custom (WebGL) layers and paint
-    // ownership". The contour overlay is a plain DOM canvas, not a MapLibre
-    // layer, so it has no separate Layers-panel entry; it is controlled
-    // entirely from this plugin's own right panel.
+    // ownership".
     app.registerExternalNativeLayer?.({
       id: HILLSHADE_NATIVE_LAYER_ID,
-      name: "Mapterhorn Hillshade",
+      name: "Mapterhorn",
       type: "raster",
       nativeLayerIds: [MAPTERHORN_HILLSHADE_LAYER_ID],
       sourceId: MAPTERHORN_DEM_SOURCE_ID,
@@ -81,6 +80,7 @@ const plugin: GeoLibrePlugin = {
       app.registerRightPanel?.({
         id: RIGHT_PANEL_ID,
         title: "Mapterhorn",
+        icon: MAPTERHORN_ICON_DATA_URI,
         defaultWidth: 300,
         render: (container) => {
           panelHandle = renderMapterhornPanel(container, settings, (patch) => applySettings(app, patch));
