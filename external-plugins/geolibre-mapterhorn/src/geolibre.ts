@@ -1,8 +1,16 @@
 import type { GeoLibreAppAPI, GeoLibrePlugin } from "./lib/geolibre/host-api";
 import { MapterhornControl } from "./lib/mapterhorn/control";
 import { MAPTERHORN_ICON_DATA_URI } from "./lib/mapterhorn/icon";
-import { MAPTERHORN_DEM_SOURCE_ID, MAPTERHORN_HILLSHADE_LAYER_ID, MapterhornLayerManager } from "./lib/mapterhorn/layer-manager";
-import { DEFAULT_SETTINGS, normalizeSettings, type MapterhornSettings } from "./lib/mapterhorn/settings";
+import {
+  MAPTERHORN_DEM_SOURCE_ID,
+  MAPTERHORN_HILLSHADE_LAYER_ID,
+  MapterhornLayerManager,
+} from "./lib/mapterhorn/layer-manager";
+import {
+  DEFAULT_SETTINGS,
+  normalizeSettings,
+  type MapterhornSettings,
+} from "./lib/mapterhorn/settings";
 import { renderMapterhornPanel, type MapterhornPanelHandle } from "./lib/panel/panel";
 import {
   MAPTERHORN_URL_PARAMETER_NAMES,
@@ -83,7 +91,9 @@ const plugin: GeoLibrePlugin = {
         icon: MAPTERHORN_ICON_DATA_URI,
         defaultWidth: 300,
         render: (container) => {
-          panelHandle = renderMapterhornPanel(container, settings, (patch) => applySettings(app, patch));
+          panelHandle = renderMapterhornPanel(container, settings, (patch) =>
+            applySettings(app, patch),
+          );
           return () => {
             panelHandle?.destroy();
             panelHandle = null;

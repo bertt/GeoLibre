@@ -51,7 +51,11 @@ export function normalizeSettings(
     // Blank/whitespace-only input falls back to the stock Mapterhorn URL
     // rather than leaving the plugin with an empty tile template.
     tileUrlTemplate: merged.tileUrlTemplate?.trim() || MAPTERHORN_TILE_URL_TEMPLATE,
-    exaggeration: clamp(merged.exaggeration, SETTINGS_LIMITS.exaggeration.min, SETTINGS_LIMITS.exaggeration.max),
+    exaggeration: clamp(
+      merged.exaggeration,
+      SETTINGS_LIMITS.exaggeration.min,
+      SETTINGS_LIMITS.exaggeration.max,
+    ),
     hillshadeStrength: clamp(
       merged.hillshadeStrength,
       SETTINGS_LIMITS.hillshadeStrength.min,

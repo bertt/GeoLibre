@@ -88,14 +88,9 @@ async function createZip(entries) {
 function dosDateTime(dateValue) {
   const year = Math.max(1980, dateValue.getFullYear());
   return {
-    date:
-      ((year - 1980) << 9) |
-      ((dateValue.getMonth() + 1) << 5) |
-      dateValue.getDate(),
+    date: ((year - 1980) << 9) | ((dateValue.getMonth() + 1) << 5) | dateValue.getDate(),
     time:
-      (dateValue.getHours() << 11) |
-      (dateValue.getMinutes() << 5) |
-      (dateValue.getSeconds() >> 1),
+      (dateValue.getHours() << 11) | (dateValue.getMinutes() << 5) | (dateValue.getSeconds() >> 1),
   };
 }
 

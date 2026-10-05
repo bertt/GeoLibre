@@ -25,6 +25,8 @@ describe("normalizeSettings", () => {
   });
 
   it("falls back to the stock tile URL for blank input", () => {
-    expect(normalizeSettings({ tileUrlTemplate: "  " }).tileUrlTemplate).toBe(DEFAULT_SETTINGS.tileUrlTemplate);
+    expect(normalizeSettings({ tileUrlTemplate: "  " }).tileUrlTemplate).toBe(
+      DEFAULT_SETTINGS.tileUrlTemplate,
+    );
   });
 });

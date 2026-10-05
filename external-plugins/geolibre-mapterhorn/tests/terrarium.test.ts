@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { decodeTerrariumImage, decodeTerrariumPixel, mapterhornTileUrl } from "../src/lib/mapterhorn/terrarium";
+import {
+  decodeTerrariumImage,
+  decodeTerrariumPixel,
+  mapterhornTileUrl,
+} from "../src/lib/mapterhorn/terrarium";
 
 describe("decodeTerrariumPixel", () => {
   it("decodes the terrarium zero-elevation baseline (R=128, G=0, B=0)", () => {

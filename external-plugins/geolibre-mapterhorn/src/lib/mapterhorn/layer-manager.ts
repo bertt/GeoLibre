@@ -86,8 +86,16 @@ export class MapterhornLayerManager {
 
     const hillshadeVisibility = next.enabled ? "visible" : "none";
     map.setLayoutProperty(MAPTERHORN_HILLSHADE_LAYER_ID, "visibility", hillshadeVisibility);
-    map.setPaintProperty(MAPTERHORN_HILLSHADE_LAYER_ID, "hillshade-exaggeration", next.hillshadeStrength);
-    map.setPaintProperty(MAPTERHORN_HILLSHADE_LAYER_ID, "hillshade-illumination-direction", next.hillshadeDirection);
+    map.setPaintProperty(
+      MAPTERHORN_HILLSHADE_LAYER_ID,
+      "hillshade-exaggeration",
+      next.hillshadeStrength,
+    );
+    map.setPaintProperty(
+      MAPTERHORN_HILLSHADE_LAYER_ID,
+      "hillshade-illumination-direction",
+      next.hillshadeDirection,
+    );
 
     if (next.tileUrlTemplate !== previous.tileUrlTemplate) {
       const source = map.getSource(MAPTERHORN_DEM_SOURCE_ID) as RasterDEMTileSource | undefined;
@@ -111,7 +119,11 @@ export class MapterhornLayerManager {
    */
   setHillshadeVisible(visible: boolean): void {
     if (!this.added) return;
-    this.map.setLayoutProperty(MAPTERHORN_HILLSHADE_LAYER_ID, "visibility", visible ? "visible" : "none");
+    this.map.setLayoutProperty(
+      MAPTERHORN_HILLSHADE_LAYER_ID,
+      "visibility",
+      visible ? "visible" : "none",
+    );
   }
 
   private applyTerrain(): void {

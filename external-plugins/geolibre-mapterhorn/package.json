@@ -1,9 +1,20 @@
 {
   "name": "geolibre-mapterhorn",
   "version": "0.1.0",
-  "description": "GeoLibre plugin: live hillshade, vertical exaggeration, 3D terrain, and contours from Mapterhorn global terrain tiles, with an outlier-trimmed elevation statistics readout.",
-  "type": "module",
   "private": true,
+  "description": "GeoLibre plugin: live hillshade, vertical exaggeration, 3D terrain, and contours from Mapterhorn global terrain tiles, with an outlier-trimmed elevation statistics readout.",
+  "keywords": [
+    "geolibre",
+    "hillshade",
+    "maplibre",
+    "maplibre-gl",
+    "mapterhorn",
+    "plugin",
+    "terrain"
+  ],
+  "license": "MIT",
+  "author": "",
+  "type": "module",
   "scripts": {
     "build:geolibre": "vite build --config vite.geolibre.config.ts",
     "package:geolibre": "npm run build:geolibre && node scripts/package-geolibre-plugin.mjs",
@@ -12,20 +23,6 @@
     "test": "vitest --run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint . --report-unused-disable-directives --max-warnings 0"
-  },
-  "keywords": [
-    "geolibre",
-    "maplibre",
-    "maplibre-gl",
-    "mapterhorn",
-    "terrain",
-    "hillshade",
-    "plugin"
-  ],
-  "author": "",
-  "license": "MIT",
-  "peerDependencies": {
-    "maplibre-gl": ">=3.0.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.38.0",
@@ -37,5 +34,8 @@
     "typescript-eslint": "^8.60.1",
     "vite": "^8.0.16",
     "vitest": "^4.1.8"
+  },
+  "peerDependencies": {
+    "maplibre-gl": ">=3.0.0"
   }
 }

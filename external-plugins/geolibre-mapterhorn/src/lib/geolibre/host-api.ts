@@ -13,11 +13,7 @@
  */
 
 /** Corner of the map a control can be docked to. */
-export type GeoLibreMapControlPosition =
-  | "top-left"
-  | "top-right"
-  | "bottom-left"
-  | "bottom-right";
+export type GeoLibreMapControlPosition = "top-left" | "top-right" | "bottom-left" | "bottom-right";
 
 /**
  * Minimal GeoJSON `FeatureCollection` shape used when a plugin hands the host a
@@ -156,10 +152,7 @@ export interface GeoLibreAppAPI<TControl extends GeoLibreControl = GeoLibreContr
    * (for example, the slot is occupied), in which case the plugin should treat
    * activation as failed.
    */
-  addMapControl: (
-    control: TControl,
-    position?: GeoLibreMapControlPosition,
-  ) => boolean;
+  addMapControl: (control: TControl, position?: GeoLibreMapControlPosition) => boolean;
   /** Remove a previously added control from the map. */
   removeMapControl: (control: TControl) => void;
   /**
@@ -188,17 +181,12 @@ export interface GeoLibreAppAPI<TControl extends GeoLibreControl = GeoLibreContr
    * and `null` (asset not resolvable) as "this asset is unavailable", hiding any
    * UI that depends on it.
    */
-  resolvePluginAssetUrl?: (
-    pluginId: string,
-    relativePath: string,
-  ) => string | null;
+  resolvePluginAssetUrl?: (pluginId: string, relativePath: string) => string | null;
   /**
    * Hand the host a dataset to render as a native MapLibre layer it owns. See
    * {@link GeoLibreNativeLayerRegistration}.
    */
-  registerExternalNativeLayer?: (
-    layer: GeoLibreNativeLayerRegistration,
-  ) => void;
+  registerExternalNativeLayer?: (layer: GeoLibreNativeLayerRegistration) => void;
   /** Remove a native layer previously registered with the given id. */
   unregisterExternalNativeLayer?: (id: string) => void;
   /**
@@ -239,9 +227,7 @@ export interface GeoLibreAppAPI<TControl extends GeoLibreControl = GeoLibreContr
    * called. Several floating panels can be open at once and they do not shrink
    * the map. See {@link GeoLibreFloatingPanelRegistration}.
    */
-  registerFloatingPanel?: (
-    panel: GeoLibreFloatingPanelRegistration,
-  ) => () => void;
+  registerFloatingPanel?: (panel: GeoLibreFloatingPanelRegistration) => () => void;
   /** Remove a registered floating panel (closing it if open). */
   unregisterFloatingPanel?: (id: string) => void;
   /** Open a floating panel (or bring an already-open one to the front). */
@@ -375,8 +361,5 @@ export interface GeoLibrePlugin<TControl extends GeoLibreControl = GeoLibreContr
   /** Serialize plugin state so the host can save it with the project. */
   getProjectState?: () => unknown;
   /** Restore plugin state previously produced by {@link getProjectState}. */
-  applyProjectState?: (
-    app: GeoLibreAppAPI<TControl>,
-    state: unknown,
-  ) => boolean | void;
+  applyProjectState?: (app: GeoLibreAppAPI<TControl>, state: unknown) => boolean | void;
 }

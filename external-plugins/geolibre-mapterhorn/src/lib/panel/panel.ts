@@ -76,7 +76,12 @@ function appendSection(parent: HTMLElement, title: string): void {
   parent.appendChild(el);
 }
 
-function appendToggle(parent: HTMLElement, label: string, value: boolean, onChange: (value: boolean) => void): void {
+function appendToggle(
+  parent: HTMLElement,
+  label: string,
+  value: boolean,
+  onChange: (value: boolean) => void,
+): void {
   const row = document.createElement("label");
   row.className = `${CSS_PREFIX}-row ${CSS_PREFIX}-toggle`;
 
